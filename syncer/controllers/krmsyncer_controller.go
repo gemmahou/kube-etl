@@ -34,6 +34,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/source"
@@ -294,6 +295,7 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 	return ctrl.NewControllerManagedBy(r.Manager).
 		For(u).
 		Named(fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 10}).
 		Complete(dr)
 }
 
@@ -321,6 +323,7 @@ func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer 
 	return ctrl.NewControllerManagedBy(r.Manager).
 		Named(fmt.Sprintf("dynamic-puller-%s-%s-%s-%s-%s", krmsyncer.Namespace, krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef.Name, gvk.Group, gvk.Version, gvk.Kind)).
 		WatchesRawSource(source.Kind[client.Object](remoteCluster.GetCache(), u, &handler.EnqueueRequestForObject{})).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 10}).
 		Complete(dr)
 }
 
@@ -406,25 +409,58 @@ func (r *DynamicResourceReconciler) ruleMatchesGVK(rule krmv1alpha1.ResourceRule
 	return rule.Group == gvk.Group && rule.Version == gvk.Version && rule.Kind == gvk.Kind
 }
 
-func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
+	hasLoopError := false
+	var lastTransitionTime time.Time
+
+	defer func() {
+		success := "true"
+		if err != nil || hasLoopError {
+			success = "false"
+		}
+		if !lastTransitionTime.IsZero() {
+			latency := time.Since(lastTransitionTime).Seconds()
+			SyncLatency.WithLabelValues(req.Namespace, r.GVK.Group, r.GVK.Version, r.GVK.Kind, success).Observe(latency)
+			if success == "true" {
+				SyncSuccessTotal.WithLabelValues(req.Namespace).Inc()
+			}
+		}
+	}()
 
 	// Fetch the resource from Source cluster
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(r.GVK)
-	err := r.RemoteClient.Get(ctx, req.NamespacedName, u)
+	err = r.RemoteClient.Get(ctx, req.NamespacedName, u)
 	isDeleted := false
 	if err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			isDeleted = true
+			err = nil // Not a fatal error
 		} else {
 			return ctrl.Result{}, err
+		}
+	} else {
+		// Extract lastTransitionTime from status.conditions where type is "Ready"
+		if conditions, found, _ := unstructured.NestedSlice(u.Object, "status", "conditions"); found {
+			for _, c := range conditions {
+				if cond, ok := c.(map[string]interface{}); ok {
+					if cond["type"] == "Ready" {
+						if val, ok := cond["lastTransitionTime"].(string); ok {
+							if t, err := time.Parse(time.RFC3339, val); err == nil {
+								lastTransitionTime = t
+							}
+						}
+						break
+					}
+				}
+			}
 		}
 	}
 
 	// Fetch all Syncers to find matching rules (Active ones)
 	var krmsyncers krmv1alpha1.KRMSyncerList
-	if err := r.LocalClient.List(ctx, &krmsyncers); err != nil {
+	if err = r.LocalClient.List(ctx, &krmsyncers); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -476,10 +512,11 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			// Determine Destination Client
 			var destClient client.Client
 			if r.Mode == krmv1alpha1.ModePush {
-				var err error
-				destClient, err = r.getRemoteClient(ctx, &krmsyncer)
-				if err != nil {
-					logger.Error(err, "Failed to get remote client")
+				var clientErr error
+				destClient, clientErr = r.getRemoteClient(ctx, &krmsyncer)
+				if clientErr != nil {
+					logger.Error(clientErr, "Failed to get remote client")
+					hasLoopError = true
 					continue
 				}
 			} else {
@@ -494,10 +531,11 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				toDelete.SetNamespace(req.Namespace)
 
 				logger.Info("Deleting resource on destination cluster", "name", req.Name, "namespace", req.Namespace)
-				if err := destClient.Delete(ctx, toDelete); err != nil {
-					if !errors.IsNotFound(err) {
+				if deleteErr := destClient.Delete(ctx, toDelete); deleteErr != nil {
+					if !errors.IsNotFound(deleteErr) {
 						// TODO: report failure in syncer status
-						logger.Error(err, "Failed to delete resource on destination cluster")
+						logger.Error(deleteErr, "Failed to delete resource on destination cluster")
+						hasLoopError = true
 					}
 				}
 				continue
@@ -507,10 +545,11 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			logger.Info("Syncing resource to destination cluster", "name", u.GetName(), "namespace", u.GetNamespace())
 
 			syncFields := rule.SyncFields
-			destObj, err := r.filterFields(u, syncFields)
-			if err != nil {
+			destObj, filterErr := r.filterFields(u, syncFields)
+			if filterErr != nil {
 				// TODO: report failure in syncer status
-				logger.Error(err, "Failed to filter fields")
+				logger.Error(filterErr, "Failed to filter fields")
+				hasLoopError = true
 				continue
 			}
 
@@ -520,9 +559,10 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			destObj.SetGeneration(0)
 			destObj.SetManagedFields(nil)
 
-			if err := r.applyToDestination(ctx, destClient, destObj); err != nil {
+			if applyErr := r.applyToDestination(ctx, destClient, destObj); applyErr != nil {
 				// TODO: report failure in syncer status
-				logger.Error(err, "Failed to apply to destination cluster")
+				logger.Error(applyErr, "Failed to apply to destination cluster")
+				hasLoopError = true
 			} else {
 				logger.Info("Successfully synced resource to destination cluster", "name", u.GetName(), "namespace", u.GetNamespace())
 			}

@@ -22,7 +22,6 @@ vet: ## Run go vet against code.
 
 .PHONY: test
 test: fmt vet ## Run tests.
-	export KUBEBUILDER_ASSETS=$$(setup-envtest use -p path); \
 	go test ./... -coverprofile cover.out
 
 .PHONY: build

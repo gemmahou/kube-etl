@@ -30,6 +30,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	krmSyncer "github.com/gke-labs/kube-etl/syncer/controllers"
 )
@@ -54,12 +55,14 @@ func main() {
 }
 
 func run(ctx context.Context) error {
+	var metricsAddr string
 	// Configure logging
 	klogFlagSet := goflag.NewFlagSet("klog", goflag.ExitOnError)
 	klog.InitFlags(klogFlagSet)
 	// Support default klog verbosity `-v`
 	flag.CommandLine.AddGoFlag(klogFlagSet.Lookup("v"))
 	flag.CommandLine.AddGoFlagSet(goflag.CommandLine)
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.Parse()
 
 	ctx = klog.NewContext(ctx, setupLog)
@@ -68,7 +71,11 @@ func run(ctx context.Context) error {
 	setupLog.Info("Creating manager")
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: metricsAddr,
+		},
 	})
+
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		return err
