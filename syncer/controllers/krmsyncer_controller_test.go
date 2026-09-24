@@ -521,24 +521,24 @@ func TestFilterFields(t *testing.T) {
 	}
 
 	src := &unstructured.Unstructured{
-		Object: map[string]interface{}{
+		Object: map[string]any{
 			"apiVersion": "syncer.gkelabs.io/v1alpha1",
 			"kind":       "KRMSyncer",
-			"metadata": map[string]interface{}{
+			"metadata": map[string]any{
 				"name":      "test",
 				"namespace": "default",
-				"labels": map[string]interface{}{
+				"labels": map[string]any{
 					"l1": "v1",
 				},
 			},
-			"spec": map[string]interface{}{
+			"spec": map[string]any{
 				"resourceID": "id1",
-				"resource": map[string]interface{}{
+				"resource": map[string]any{
 					"ID": "id2",
 				},
 				"other": "val",
 			},
-			"status": map[string]interface{}{
+			"status": map[string]any{
 				"phase": "Active",
 			},
 		},
@@ -568,25 +568,25 @@ func TestFilterFields(t *testing.T) {
 
 	// Test case 2: Sync full "spec" with nested fields of various types
 	srcFull := &unstructured.Unstructured{
-		Object: map[string]interface{}{
+		Object: map[string]any{
 			"apiVersion": "v1",
 			"kind":       "ConfigMap",
-			"metadata": map[string]interface{}{
+			"metadata": map[string]any{
 				"name": "full-spec-test",
 			},
-			"spec": map[string]interface{}{
+			"spec": map[string]any{
 				"primitive": "string-val",
 				"integer":   int64(42),
 				"boolean":   true,
-				"complex": map[string]interface{}{
+				"complex": map[string]any{
 					"field1": "val1",
 					"field2": int64(2),
-					"nested": map[string]interface{}{
+					"nested": map[string]any{
 						"deep": "deeper",
 					},
 				},
-				"list": []interface{}{
-					map[string]interface{}{"item": int64(1)},
+				"list": []any{
+					map[string]any{"item": int64(1)},
 					"simple-item",
 				},
 			},

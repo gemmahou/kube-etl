@@ -560,7 +560,7 @@ func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsync
 
 func (r *DynamicResourceReconciler) filterFields(src *unstructured.Unstructured, fields []string) (*unstructured.Unstructured, error) {
 	dest := &unstructured.Unstructured{
-		Object: make(map[string]interface{}),
+		Object: make(map[string]any),
 	}
 	dest.SetGroupVersionKind(src.GroupVersionKind())
 	dest.SetName(src.GetName())
@@ -602,10 +602,10 @@ func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, dest
 	// If status is present, we also need to patch the status subresource.
 	if found {
 		statusObj := &unstructured.Unstructured{
-			Object: map[string]interface{}{
+			Object: map[string]any{
 				"apiVersion": obj.GetAPIVersion(),
 				"kind":       obj.GetKind(),
-				"metadata": map[string]interface{}{
+				"metadata": map[string]any{
 					"name":      obj.GetName(),
 					"namespace": obj.GetNamespace(),
 				},
