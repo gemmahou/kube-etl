@@ -36,7 +36,7 @@ metadata:
   name: resource-sync
 spec:
   suspend: false
-  mode: pull # New field! Can be 'push' or 'pull'. Defaults to 'pull'.
+  mode: pull
   rules:
     - group: ""
       version: "v1"
@@ -45,11 +45,28 @@ spec:
     - group: "networking.k8s.io"
       version: "v1"
       kind: "Ingress"
-  remote: # Renamed field!
+  remote:
     clusterConfig:
       kubeConfigSecretRef:
         name: "remote-cluster-kubeconfig"
 ```
+
+### Syncing all Config Connector (KCC) resources
+
+To sync every KCC resource, use a glob rule for the KCC API groups:
+
+```yaml
+  rules:
+    - group: "*.cnrm.cloud.google.com"
+      version: "*"
+      kind: "*"
+```
+
+The controller asks the source cluster's API discovery for every group ending in `cnrm.cloud.google.com` and watches each kind in each served version. To sync one KCC service only, set an exact group with `version: "*"` and `kind: "*"`, for example `group: "sql.cnrm.cloud.google.com"`.
+
+> [!NOTE]
+> Globs (`*`) are only allowed for KCC groups, and only when both `version` and `kind` are `"*"`. The controller discovers KCC kinds when it reconciles the `KRMSyncer`. If you install new KCC CRDs later, they aren't watched until the `KRMSyncer` is reconciled again (for example, after you edit it).
+
 ## Run Integration test
 ```bash
 # Build the manager binary
@@ -84,7 +101,7 @@ This command:
 2. Builds and pushes a fresh `gcr.io/<project>/krmsyncer/controller:latest`, then deletes all older images in that repository (and the stale local copy).
 3. Creates the `source-cluster` kubeconfig Secret. The kubeconfig authenticates with `gke-gcloud-auth-plugin --use_application_default_credentials`, so it contains no user credentials.
 4. Deploys the CRD, RBAC, and controller into the `krmsyncer-system` namespace of the destination cluster.
-5. Applies a sample `KRMSyncer` CR.
+5. Applies a sample `KRMSyncer` CR that pulls all KCC resources (`*.cnrm.cloud.google.com`, including `spec` and `status`) from the source cluster. See [Syncing all Config Connector (KCC) resources](#syncing-all-config-connector-kcc-resources).
 
 Prerequisites: `kubectl`, `gcloud`, and `docker`. The destination cluster must have Workload Identity enabled, and you need a kubeconfig context for the source cluster (`gcloud container clusters get-credentials`).
 

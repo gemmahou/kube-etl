@@ -25,7 +25,9 @@ import (
 	"strings"
 )
 
-// generateSyncConfig returns the sample KRMSyncer CR that syncs PubSubTopics from the source cluster.
+// generateSyncConfig returns the sample KRMSyncer CR that syncs all Config Connector (KCC)
+// resources from the source cluster. The controller expands the "*.cnrm.cloud.google.com"
+// glob into every KCC group/version/kind served by the source cluster.
 func generateSyncConfig(namespace string) string {
 	return fmt.Sprintf(`apiVersion: etl.gkelabs.io/v1alpha1
 kind: KRMSyncer
@@ -40,12 +42,12 @@ spec:
       kubeConfigSecretRef:
         name: %s
   rules:
-  - group: pubsub.cnrm.cloud.google.com
-    kind: PubSubTopic
+  - group: "*.cnrm.cloud.google.com"
+    version: "*"
+    kind: "*"
     syncFields:
     - spec
     - status
-    version: v1beta1
 `, syncConfigName, namespace, sourceSecretName)
 }
 
