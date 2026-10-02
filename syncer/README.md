@@ -36,7 +36,7 @@ metadata:
   name: resource-sync
 spec:
   suspend: false
-  mode: pull # New field! Can be 'push' or 'pull'. Defaults to 'pull'.
+  mode: pull # Defaults to 'pull'.
   rules:
     - group: ""
       version: "v1"
@@ -45,7 +45,7 @@ spec:
     - group: "networking.k8s.io"
       version: "v1"
       kind: "Ingress"
-  remote: # Renamed field!
+  remote:
     clusterConfig:
       kubeConfigSecretRef:
         name: "remote-cluster-kubeconfig"
@@ -59,41 +59,56 @@ make test-integration
 
 ## Getting Started
 
-### 1. Prerequisites
-- **Remote Cluster Secret**: A Secret in the same namespace as the `KRMSyncer` resource containing the `kubeconfig` key with the target cluster's configuration.
-- **RBAC**: The operator needs permissions to read the resources defined in the rules and to manage `Syncer` resources.
+### Prerequisites
 
-### 2. Build and Deploy
+Before running [`krmsyncer.sh`](krmsyncer.sh), make sure you have the following.
+
+**Local tools**
+
+- `kubectl`, `gcloud`, and `docker`.
+- [`gke-gcloud-auth-plugin`](https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl#install_plugin), so `kubectl` can authenticate to GKE.
+
+**Clusters**
+
+- The destination cluster must have [Workload Identity](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity) enabled.
+- You need kubeconfig contexts for both clusters. Create them with:
+  ```bash
+  gcloud container clusters get-credentials <SOURCE_CLUSTER_NAME> --location <SOURCE_CLUSTER_LOCATION> --project <GCP_PROJECT_ID>
+  gcloud container clusters get-credentials <DEST_CLUSTER_NAME> --location <DEST_CLUSTER_LOCATION> --project <GCP_PROJECT_ID>
+  ```
+- To use the sample `KRMSyncer` CR, destination cluster needs the Config Connector CRDs installed for all the resources in the source cluster.
+
+### 1. Deploy KRMSyncer to the Destination Cluster
+
+Use the [`krmsyncer.sh`](krmsyncer.sh) script.
 
 ```bash
 # Build the manager binary
 cd syncer
 make build
 
-# Build Docker image
-docker build -t syncer-operator:latest .
+./krmsyncer.sh \
+  --source-cluster <SOURCE_CLUSTER_NAME> \
+  --source-location <SOURCE_CLUSTER_LOCATION> \
+  --dest-cluster <DEST_CLUSTER_NAME> \
+  --dest-location <DEST_CLUSTER_LOCATION> \
+  --project <GCP_PROJECT_ID> \
+  [-n <NAMESPACE>] \
+  [-i <IMAGE>]
 ```
 
-Alternatively, you can start the KRMSyncer controller locally.
-```bash
-go run main.go
-```
+`-n` sets the namespace for the `KRMSyncer` CR and the `source-cluster` Secret (default: `krmsyncer-system`, the same namespace as the controller).
 
-### 3. Usage Example: Cross-Cluster Sync
+`-i` sets the controller image to deploy. Default to `gcr.io/<project>/krmsyncer/controller:latest`.
 
-1. **Extract the Remote Kubeconfig**:
-    1. Find the remote cluster context name:
-       ```bash
-       kubectl config get-contexts
-       ```
+This command:
+1. Configures Workload Identity. It creates the `krmsyncer@<project>.iam.gserviceaccount.com` GSA, grants it `roles/container.viewer`, and binds it to the `krmsyncer-system/krmsyncer-controller-manager` KSA.
+2. Builds and pushes the controller image, unless `--image` points to an image that already exists.
+3. Creates the `source-cluster` kubeconfig Secret. The kubeconfig authenticates with `gke-gcloud-auth-plugin --use_application_default_credentials`, so it contains no user credentials.
+4. Deploys the RBAC, KRMSyncer CRD and controller into the `krmsyncer-system` namespace of the destination cluster.
+5. Applies a sample `KRMSyncer` CR that syncs all Config Connector resources from the source cluster. The destination cluster needs the matching KCC CRDs pre-installed.
 
-    2. Export the context to file:
-       ```bash
-       kubectl config view --context=<REMOTE_CONTEXT_NAME> --minify --flatten > remote-kubeconfig.yaml
-       * Replace <REMOTE_CONTEXT_NAME> with the name found above
-       * --minify: Only includes the information for that specific context.
-       * --flatten: Embeds the certificate data directly into the file so it doesn't rely on external file paths.
-       ```
+The sample `KRMSyncer` CR and the source kubeconfig are YAML templates in [`config/templates/`](config/templates).
 
     3. Verify the file:
        ```bash

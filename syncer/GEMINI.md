@@ -17,6 +17,7 @@ This project is a standard Kubernetes controller built using `controller-runtime
 *   `api/`: Contains the Custom Resource Definition (CRD) types (e.g., `KRMSyncer`).
 *   `controllers/`: Contains the reconciliation logic (`KRMSyncerReconciler`).
 *   `config/`: Kustomize configuration for deploying the controller and CRDs.
+    *   `config/templates/`: YAML templates (sample `KRMSyncer` CR, source kubeconfig), filled in by `krmsyncer.sh`.
 *   `main.go`: The entry point for the controller manager.
 
 ## Key Components
