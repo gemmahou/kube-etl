@@ -36,7 +36,7 @@ run: fmt vet ## Run a controller from your host.
 .PHONY: test manifests generate
 # Generate manifests (CRDs, RBAC, etc.)
 manifests:
-	controller-gen crd rbac:roleName=manager-role paths="./..." output:crd:artifacts:config=config/crd/
+	controller-gen crd rbac:roleName=krmsyncer-manager-role paths="./..." output:crd:artifacts:config=config/crd/
 
 # Generate code (deepcopy, etc.)
 generate:
@@ -58,10 +58,10 @@ install: manifests
 uninstall: manifests
 	kustomize build config/crd | kubectl delete -f -
 
-# Deploy controller in the configured Kubernetes cluster in ~/.kube/config
+# Deploy controller in the configured Kubernetes cluster in ~/.kube/config.
+# The controller:latest placeholder in config/manager/manager.yaml is replaced with ${IMG}.
 deploy: manifests
-	cd config/manager && kustomize edit set image controller=${IMG}
-	kustomize build config/default | kubectl apply -f -
+	kustomize build config/default | sed 's#image: controller:latest#image: ${IMG}#' | kubectl apply -f -
 
 ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
 undeploy:
