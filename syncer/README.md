@@ -1,12 +1,12 @@
 # KRMSyncer
 
-The KRMSyncer is a Kubernetes-native tool designed for multi-cluster state synchronization. It facilitates **Active-Passive (Failover)** scenarios where one cluster acts as the leader (Syncer's `Source`) and another acts as a standby (Syncer's `Destination`).
+The KRMSyncer is a Kubernetes-native tool designed for multi-cluster KRM resources synchronization.
 
 ## Features
 
 - **Push & Pull Models:** Support both pushing from local to remote and pulling from remote to local clusters.
 - **Dynamic Watching:** Dynamically registers watches for resources specified in the configuration.
-- **Resource Syncing:** Syncs standard resources (e.g., ConfigMaps, Secrets) and CRDs.
+- **Resource Syncing:** Syncs standard resources (e.g., ConfigMaps, Secrets).
 - **Status Syncing:** Optionally syncs the status subresource.
 - **Suspension:** Supports pausing sync operations via a `suspend` field.
 - **Namespace Mapping:** Supports syncing to a specific destination namespace.
@@ -18,7 +18,7 @@ The operator manages the `KRMSyncer` Custom Resource to coordinate resource repl
 1.  **Reconciling (Active cluster)**:
     *   Watches specific Kubernetes resources defined in rules.
     *   Continuously syncs their state directly to the destination.
-    *   The remote cluster is a GKE cluster referenced directly in the spec; the controller authenticates with its own Google Workload Identity.
+    *   The remote GKE cluster is referenced directly in `spec.remote.gkeCluster`; the controller authenticates to it with Workload Identity.
     *   Default mode is `pull`.
 
 2.  **Suspended (Passive cluster)**:
@@ -36,22 +36,24 @@ metadata:
   name: resource-sync
 spec:
   suspend: false
-  mode: pull # New field! Can be 'push' or 'pull'. Defaults to 'pull'.
+  mode: pull # Defaults to 'pull'.
   rules:
     - group: ""
       version: "v1"
-      kind: "ConfigMap"
-      namespaces: ["default"] # Only sync ConfigMaps in the 'default' namespace
-    - group: "networking.k8s.io"
-      version: "v1"
-      kind: "Ingress"
+      kind: "PubsubTopic"
+      namespaces: ["default"] # Only sync PubsubTopic in the 'default' namespace
   remote:
     gkeCluster:
       project: my-project
       location: us-central1
-      name: remote-cluster
+      name: source-cluster
       endpoint: Default # Optional. Default | DNS | PrivateIP
 ```
+
+`spec.remote.gkeCluster.endpoint` selects how the controller reaches the remote cluster:
+- `Default` (default): the cluster's default endpoint, the same one `gcloud container clusters get-credentials` uses.
+- `DNS`: the cluster's DNS-based endpoint. It must be enabled for external traffic (`gcloud container clusters update --enable-dns-access`); needs no VPC connectivity, and is unaffected by credential rotation.
+- `PrivateIP`: the cluster's private endpoint. The controller must be able to reach the cluster's VPC.
 ## Run Integration test
 ```bash
 # Build the manager binary
@@ -61,98 +63,111 @@ make test-integration
 
 ## Getting Started
 
-### 1. Prerequisites
-- **Remote GKE cluster**: The remote cluster must be a GKE cluster. It is referenced in `spec.remote.gkeCluster` by project, location and name.
-- **Control plane endpoint**: `spec.remote.gkeCluster.endpoint` selects how the controller reaches the remote cluster:
-  - `Default` (default): the cluster's default endpoint, the same one `gcloud container clusters get-credentials` uses.
-  - `DNS`: the cluster's DNS-based endpoint (it must be enabled on the cluster). This works from anywhere with IAM-based access and needs no VPC connectivity.
-  - `PrivateIP`: the cluster's private endpoint. The controller must have network connectivity to the cluster's VPC.
-- **Google service account for the controller**: The controller authenticates to the GKE API and the remote cluster with Application Default Credentials. On GKE, the `krmsyncer-system/krmsyncer-controller-manager` Kubernetes service account must impersonate a Google service account (GSA) through [Workload Identity Federation for GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity) (see "Link Kubernetes ServiceAccounts to IAM").
-  - `container.clusters.get` on the remote cluster's project (e.g. `roles/container.clusterViewer`), the controller also uses it to look up the cluster endpoint and CA.
-  - Kubernetes RBAC on the remote cluster to read (pull mode) or write (push mode) the synced resources, bound to the GSA's email as a `User` subject.
-- **RBAC**: The operator needs permissions to read the resources defined in the rules and to manage `Syncer` resources.
+### Prerequisites
 
-> [!WARNING]
-> All `KRMSyncer` objects share the controller's Google identity. Anyone who can create a `KRMSyncer` can sync with any cluster that identity can access, so restrict who can create `KRMSyncer` objects.
+Before running [`krmsyncer.sh`](krmsyncer.sh), make sure you have the following.
 
-### 2. Build and Deploy
+**Local tools**
+
+- `kubectl`, `gcloud`, and `docker`.
+- [`gke-gcloud-auth-plugin`](https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl#install_plugin), so your local `kubectl` context can authenticate to the destination cluster.
+- Push access to the image registry (e.g. `gcloud auth configure-docker gcr.io`).
+
+**Clusters**
+
+- The destination cluster must have [Workload Identity](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity) enabled.
+- You need permission to create service accounts and grant IAM roles in the project.
+- You need permission to grant IAM roles in the source cluster's project, and to describe the source cluster.
+- You need a kubeconfig context for the destination cluster, with permission to deploy on it. Create it with:
+  ```bash
+  gcloud container clusters get-credentials <DEST_CLUSTER_NAME> --location <DEST_CLUSTER_LOCATION> --project <GCP_PROJECT_ID>
+  ```
+  No kubeconfig for the source cluster is needed.
+- The source cluster must expose the endpoint you select with `--source-endpoint`, and the destination cluster must be able to reach it (see [Network access to the source cluster](#network-access-to-the-source-cluster)).
+- To use the sample `KRMSyncer` CR, destination cluster needs the Config Connector CRDs installed for all the resources in the source cluster.
+
+### Network access to the source cluster
+
+The controller runs in the destination cluster and calls the source cluster's control plane directly, so the destination cluster's Pods need a network path to the endpoint selected by `--source-endpoint`. Configure this before deploying; otherwise the controller only logs connection timeouts.
+
+| `--source-endpoint` | Network requirements |
+|---|---|
+| `DNS` | None between the clusters: traffic goes over Google's network and access is controlled by IAM (`container.clusters.connect`, included in `roles/container.viewer`). The DNS endpoint must accept external traffic: `gcloud container clusters update <SOURCE_CLUSTER_NAME> --location <SOURCE_CLUSTER_LOCATION> --enable-dns-access`. |
+| `PrivateIP` | The destination cluster must be able to route to the source's private endpoint: same VPC or Shared VPC, or a directly connected VPC (VPC peering, Cloud VPN, Interconnect; peering is not transitive). If the destination is in a different region than the source, the source must have [control plane global access](https://cloud.google.com/kubernetes-engine/docs/how-to/private-clusters#cp-global-access) enabled (`--enable-master-global-access`); without it, cross-region connections time out even on the same VPC. Firewall rules must allow the destination's node and Pod ranges to reach it on TCP 443. If the source enforces authorized networks on the private endpoint (`privateEndpointEnforcementEnabled`), add those ranges to its authorized networks. |
+| `Default` | The source's IP endpoint must accept the destination's traffic. If it's the public endpoint, add the destination's egress IPs (e.g. its Cloud NAT addresses) to the source's [authorized networks](https://cloud.google.com/kubernetes-engine/docs/how-to/authorized-networks). If the cluster only exposes its private endpoint, the `PrivateIP` requirements apply. |
+
+> [!NOTE]
+> **Config Controller as the source.** Config Controller clusters (`krmapihost-*`) are private clusters with a public endpoint enabled (authorized networks `0.0.0.0/0`, access still gated by IAM), control plane global access off, and DNS external traffic off. In practice:
+> - Use `--source-endpoint Default` (the public endpoint). It works from any region and VPC as long as the destination's nodes have internet egress (public IPs or Cloud NAT).
+> - Use `--source-endpoint PrivateIP` only if the destination cluster is in the same region and on the same VPC as the Config Controller instance (by default the `default` network of its project) or a connected VPC; cross-region connections to the private endpoint time out.
+> - `--source-endpoint DNS` requires enabling DNS access on the managed cluster, which may not be permitted.
+
+Inspect the source cluster's endpoints and access settings with:
+```bash
+gcloud container clusters describe <SOURCE_CLUSTER_NAME> --location <SOURCE_CLUSTER_LOCATION> --project <SOURCE_PROJECT_ID> \
+  --format="yaml(network, endpoint, privateClusterConfig.privateEndpoint, privateClusterConfig.masterGlobalAccessConfig, controlPlaneEndpointsConfig, masterAuthorizedNetworksConfig)"
+```
+
+To confirm the destination cluster can reach the endpoint, open a TCP connection to port 443 from inside it (replace the address with the selected endpoint). `open` means there is a network path; a timeout means traffic is dropped (routing, firewall or authorized networks):
+```bash
+kubectl --context=<DEST_CONTEXT> run nettest --rm -i --restart=Never --image=busybox -- \
+  nc -zv -w 10 <SOURCE_ENDPOINT> 443
+```
+
+### 1. Deploy KRMSyncer to the Destination Cluster
+
+Use the [`krmsyncer.sh`](krmsyncer.sh) script.
 
 ```bash
-# Build the manager binary
 cd syncer
-make build
 
-# Build Docker image
-docker build -t syncer-operator:latest .
+./krmsyncer.sh \
+  --source-cluster <SOURCE_CLUSTER_NAME> \
+  --source-location <SOURCE_CLUSTER_LOCATION> \
+  --dest-cluster <DEST_CLUSTER_NAME> \
+  --dest-location <DEST_CLUSTER_LOCATION> \
+  --project <GCP_PROJECT_ID> \
+  [--source-project <SOURCE_PROJECT_ID>] \
+  [--source-endpoint Default|DNS|PrivateIP] \
+  [-n <NAMESPACE>] \
+  [-i <IMAGE>] \
+  [--skip-build]
 ```
 
-Alternatively, you can start the KRMSyncer controller locally.
+`--source-project` sets the source cluster's project (default: `--project`).
+
+`--source-endpoint` selects the source cluster's control plane endpoint: `Default`, `DNS` or `PrivateIP` (default: `Default`).
+
+`-n` sets the namespace for the `KRMSyncer` CR (default: `krmsyncer-system`, the same namespace as the controller).
+
+`-i` sets the controller image to deploy. Default to `gcr.io/<project>/krmsyncer/controller:latest`.
+
+`--skip-build` deploys the image as is, without building and pushing it.
+
+This command:
+1. Configures Workload Identity. It creates the `krmsyncer@<project>.iam.gserviceaccount.com` Google Service Account (GSA), grants it `roles/container.viewer` on the source cluster's project, and lets the controller's `krmsyncer-system/krmsyncer-controller-manager` Kubernetes ServiceAccount impersonate it. `roles/container.viewer` lets the GSA look up the source cluster, connect to it (including over the DNS endpoint) and read its Kubernetes objects.
+2. Builds and pushes the controller image (unless `--skip-build` is set).
+3. Checks that the source cluster exists and exposes the selected endpoint.
+4. Deploys the RBAC, KRMSyncer CRD and controller into the `krmsyncer-system` namespace of the destination cluster, and annotates the controller's ServiceAccount with the GSA.
+5. Applies the `kcc-resource-syncer` `KRMSyncer` CR from [`config/templates/krmsyncer.yaml`](config/templates/krmsyncer.yaml). It references the source cluster in `spec.remote.gkeCluster` and syncs all Config Connector resources from it. The destination cluster needs the matching KCC CRDs pre-installed.
+
+View the controller logs with:
 ```bash
-go run main.go
+kubectl --context=gke_<project>_<dest-location>_<dest-cluster> -n krmsyncer-system logs deploy/krmsyncer-controller-manager -f
 ```
 
-### 3. Usage Example: Cross-Cluster Sync
+### 2. Verify the Results
+1. Create a test resource in the Source cluster:
+   ```bash
+   kubectl create pubsubtopic test-topic
+   ```
 
-1. **Set up a Google service account for the controller** (in the Local cluster's project):
-    ```bash
-    gcloud iam service-accounts create krmsyncer --project=<LOCAL_PROJECT>
-
-    # Allow the controller's Kubernetes service account to impersonate the GSA.
-    gcloud iam service-accounts add-iam-policy-binding krmsyncer@<LOCAL_PROJECT>.iam.gserviceaccount.com \
-      --role=roles/iam.workloadIdentityUser \
-      --member="serviceAccount:<LOCAL_PROJECT>.svc.id.goog[krmsyncer-system/krmsyncer-controller-manager]"
-
-    kubectl annotate serviceaccount krmsyncer-controller-manager -n krmsyncer-system \
-      iam.gke.io/gcp-service-account=krmsyncer@<LOCAL_PROJECT>.iam.gserviceaccount.com
-    ```
-    Instead of `kubectl annotate`, you can set the annotation in [`config/rbac/service_account.yaml`](config/rbac/service_account.yaml) before deploying.
-
-1. **Grant the GSA access to the Remote cluster**:
-    ```bash
-    # Required to authenticate to the remote cluster and to look up its endpoint and CA.
-    gcloud projects add-iam-policy-binding <REMOTE_PROJECT> \
-      --role=roles/container.clusterViewer \
-      --member=serviceAccount:krmsyncer@<LOCAL_PROJECT>.iam.gserviceaccount.com
-    ```
-    Then grant the GSA Kubernetes RBAC on the Remote cluster for the resources being synced, using its email as a `User` subject.
-
-1. **Apply the Syncer Resource** (on the Local cluster):
-    ```yaml
-    # test-syncer.yaml
-    apiVersion: syncer.gkelabs.io/v1alpha1
-    kind: KRMSyncer
-    metadata:
-      name: configmap-sync
-    spec:
-      suspend: false
-      mode: push
-      rules:
-        - group: ""
-          version: "v1"
-          kind: "ConfigMap"
-          namespaces: ["default"] # Only sync ConfigMaps in the 'default' namespace
-      remote:
-        gkeCluster:
-          project: <REMOTE_PROJECT>
-          location: <REMOTE_LOCATION>
-          name: <REMOTE_CLUSTER>
-
-    ```
-    ```bash
-    kubectl apply -f test-syncer.yaml
-    ```
-1. **Verify the Results**:
-    1. Create a test resource in the Local cluster:
-       ```bash
-       kubectl create configmap test-sync-data --from-literal=key=value1
-       ```
-
-    1. Check the Remote cluster:
-       Switch your kubectl context to the Remote cluster and verify the ConfigMap has appeared:
-       ```bash
-       kubectl --context=<remote-cluster-context> get configmap test-sync-data
-       ```
-    1.  Expected Result:
-    - The `test-sync-data` ConfigMap created in the Source cluster should automatically appear in the Passive cluster within seconds.
-    - If you update the ConfigMap in the Active cluster, the changes should reflect in the Passive cluster.
-    - If you delete it from the Active cluster, it should be removed from the Passive cluster.
+1. Check the Destination cluster:
+   Switch your kubectl context to the Destination cluster and verify the PubsubTopic has appeared:
+   ```bash
+   kubectl --context=<dest-cluster-context> get pubsubtopic test-topic
+   ```
+1.  Expected Result:
+- The `test-topic` PubsubTopic created in the Source cluster should automatically appear in the Destination cluster within seconds.
+- If you update the PubsubTopic in the Source cluster, the changes should reflect in the Destination cluster.
+- If you delete it from the Source cluster, it should be removed from the Destination cluster.
