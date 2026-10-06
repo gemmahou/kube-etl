@@ -13,7 +13,9 @@
 # limitations under the License.
 
 # Build the manager binary
-FROM golang:1.24 as builder
+# GO_VERSION should match the `go` directive in go.mod.
+ARG GO_VERSION=1.27.0
+FROM golang:${GO_VERSION} as builder
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
