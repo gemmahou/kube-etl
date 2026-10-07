@@ -30,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
-	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
@@ -45,19 +44,23 @@ type KRMSyncerReconciler struct {
 	Scheme  *runtime.Scheme
 	Manager ctrl.Manager
 
+	// RemoteConfigProvider builds rest.Configs for remote clusters.
+	// Defaults to a GKEConfigProvider.
+	RemoteConfigProvider RemoteConfigProvider
+
 	// WatchedGVKs tracks which GVKs are already being watched on the local cluster
 	WatchedGVKs map[schema.GroupVersionKind]bool
 	// WatchedRemoteGVKs tracks which GVKs are already being watched on remote clusters
 	WatchedRemoteGVKs map[RemoteGVK]bool
-	// RemoteClusters tracks the remote clusters being watched
+	// RemoteClusters tracks the remote clusters being watched, keyed by remote cluster key
 	RemoteClusters map[string]cluster.Cluster
 	mu             sync.RWMutex
 }
 
 type RemoteGVK struct {
-	RemoteNamespace string
-	RemoteSecret    string
-	GVK             schema.GroupVersionKind
+	// Cluster is the remote cluster key (see remoteClusterKey).
+	Cluster string
+	GVK     schema.GroupVersionKind
 }
 
 //+kubebuilder:rbac:groups=syncer.gkelabs.io,resources=krmsyncers,verbs=get;list;watch;create;update;patch;delete
@@ -121,27 +124,9 @@ func (r *KRMSyncerReconciler) getDiscoveryClient(ctx context.Context, krmsyncer 
 	}
 
 	// Pull mode
-	if krmsyncer.Spec.Remote == nil || krmsyncer.Spec.Remote.ClusterConfig == nil || krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef == nil {
-		return nil, fmt.Errorf("remote cluster config missing for Pull mode")
-	}
-
-	secret := &corev1.Secret{}
-	secretKey := client.ObjectKey{
-		Name:      krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef.Name,
-		Namespace: krmsyncer.Namespace,
-	}
-	if err := r.Get(ctx, secretKey, secret); err != nil {
-		return nil, err
-	}
-
-	kubeconfig, ok := secret.Data["kubeconfig"]
-	if !ok {
-		return nil, fmt.Errorf("secret %s does not contain 'kubeconfig' key", secretKey.Name)
-	}
-
-	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	restConfig, err := r.RemoteConfigProvider.RESTConfig(ctx, krmsyncer.Spec.Remote)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("remote cluster config for Pull mode: %w", err)
 	}
 	restConfig.Timeout = 10 * time.Second
 
@@ -248,17 +233,17 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 
 		for _, gvk := range gvks {
 			if mode == krmv1alpha1.ModePull {
-				if krmsyncer.Spec.Remote == nil || krmsyncer.Spec.Remote.ClusterConfig == nil || krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef == nil {
-					logger.Error(fmt.Errorf("remote cluster config missing"), "Cannot start remote watcher")
+				clusterKey, err := remoteClusterKey(krmsyncer.Spec.Remote)
+				if err != nil {
+					logger.Error(err, "Cannot start remote watcher")
 					continue
 				}
 				rgvk := RemoteGVK{
-					RemoteNamespace: krmsyncer.Namespace,
-					RemoteSecret:    krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef.Name,
-					GVK:             gvk,
+					Cluster: clusterKey,
+					GVK:     gvk,
 				}
 				if !r.WatchedRemoteGVKs[rgvk] {
-					if err := r.startRemoteWatcher(ctx, krmsyncer, gvk); err != nil {
+					if err := r.startRemoteWatcher(ctx, krmsyncer, rgvk); err != nil {
 						logger.Error(err, "Failed to start remote watcher for GVK", "gvk", gvk)
 						continue
 					}
@@ -282,10 +267,11 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 
 func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.GroupVersionKind) error {
 	dr := &DynamicResourceReconciler{
-		LocalClient:  r.Client,
-		RemoteClient: r.Client,
-		GVK:          gvk,
-		Mode:         krmv1alpha1.ModePush,
+		LocalClient:          r.Client,
+		RemoteClient:         r.Client,
+		RemoteConfigProvider: r.RemoteConfigProvider,
+		GVK:                  gvk,
+		Mode:                 krmv1alpha1.ModePush,
 	}
 
 	u := &unstructured.Unstructured{}
@@ -297,8 +283,8 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 		Complete(dr)
 }
 
-func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer, gvk schema.GroupVersionKind) error {
-	remoteCluster, err := r.getOrCreateRemoteCluster(ctx, krmsyncer)
+func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer, rgvk RemoteGVK) error {
+	remoteCluster, err := r.getOrCreateRemoteCluster(ctx, rgvk.Cluster, krmsyncer.Spec.Remote)
 	if err != nil {
 		return fmt.Errorf("failed to get remote cluster: %v", err)
 	}
@@ -306,48 +292,29 @@ func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer 
 	dr := &DynamicResourceReconciler{
 		LocalClient:  r.Client,
 		RemoteClient: remoteCluster.GetClient(),
-		GVK:          gvk,
+		GVK:          rgvk.GVK,
 		Mode:         krmv1alpha1.ModePull,
-		Remote: RemoteGVK{
-			RemoteNamespace: krmsyncer.Namespace,
-			RemoteSecret:    krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef.Name,
-			GVK:             gvk,
-		},
+		Remote:       rgvk,
 	}
 
 	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(gvk)
+	u.SetGroupVersionKind(rgvk.GVK)
 
+	gvk := rgvk.GVK
 	return ctrl.NewControllerManagedBy(r.Manager).
-		Named(fmt.Sprintf("dynamic-puller-%s-%s-%s-%s-%s", krmsyncer.Namespace, krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef.Name, gvk.Group, gvk.Version, gvk.Kind)).
+		Named(fmt.Sprintf("dynamic-puller-%s-%s-%s-%s", strings.ReplaceAll(rgvk.Cluster, "/", "-"), gvk.Group, gvk.Version, gvk.Kind)).
 		WatchesRawSource(source.Kind[client.Object](remoteCluster.GetCache(), u, &handler.EnqueueRequestForObject{})).
 		Complete(dr)
 }
 
-func (r *KRMSyncerReconciler) getOrCreateRemoteCluster(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (cluster.Cluster, error) {
+func (r *KRMSyncerReconciler) getOrCreateRemoteCluster(ctx context.Context, key string, remote *krmv1alpha1.RemoteConfig) (cluster.Cluster, error) {
 	logger := log.FromContext(ctx)
 
-	key := fmt.Sprintf("%s/%s", krmsyncer.Namespace, krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef.Name)
 	if c, ok := r.RemoteClusters[key]; ok {
 		return c, nil
 	}
 
-	// Get Remote Config
-	secret := &corev1.Secret{}
-	secretKey := client.ObjectKey{
-		Name:      krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef.Name,
-		Namespace: krmsyncer.Namespace,
-	}
-	if err := r.Get(ctx, secretKey, secret); err != nil {
-		return nil, err
-	}
-
-	kubeconfig, ok := secret.Data["kubeconfig"]
-	if !ok {
-		return nil, fmt.Errorf("secret %s does not contain 'kubeconfig' key", secretKey.Name)
-	}
-
-	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	restConfig, err := r.RemoteConfigProvider.RESTConfig(ctx, remote)
 	if err != nil {
 		return nil, err
 	}
@@ -375,6 +342,9 @@ func (r *KRMSyncerReconciler) getOrCreateRemoteCluster(ctx context.Context, krms
 }
 
 func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.RemoteConfigProvider == nil {
+		r.RemoteConfigProvider = &GKEConfigProvider{}
+	}
 	r.WatchedGVKs = make(map[schema.GroupVersionKind]bool)
 	r.WatchedRemoteGVKs = make(map[RemoteGVK]bool)
 	r.RemoteClusters = make(map[string]cluster.Cluster)
@@ -387,9 +357,11 @@ func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 type DynamicResourceReconciler struct {
 	LocalClient  client.Client
 	RemoteClient client.Client
-	GVK          schema.GroupVersionKind
-	Mode         krmv1alpha1.Mode
-	Remote       RemoteGVK // Only used for Pull mode
+	// RemoteConfigProvider builds the destination client config (Push mode only).
+	RemoteConfigProvider RemoteConfigProvider
+	GVK                  schema.GroupVersionKind
+	Mode                 krmv1alpha1.Mode
+	Remote               RemoteGVK // Only used for Pull mode
 }
 
 func (r *DynamicResourceReconciler) ruleMatchesGVK(rule krmv1alpha1.ResourceRule, gvk schema.GroupVersionKind) bool {
@@ -444,11 +416,8 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		// For Pull mode, also check Remote match
 		if r.Mode == krmv1alpha1.ModePull {
-			if krmsyncer.Spec.Remote == nil ||
-				krmsyncer.Spec.Remote.ClusterConfig == nil ||
-				krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef == nil ||
-				krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef.Name != r.Remote.RemoteSecret ||
-				krmsyncer.Namespace != r.Remote.RemoteNamespace {
+			clusterKey, err := remoteClusterKey(krmsyncer.Spec.Remote)
+			if err != nil || clusterKey != r.Remote.Cluster {
 				continue
 			}
 		}
@@ -532,25 +501,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 }
 
 func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
-	if krmsyncer.Spec.Remote == nil || krmsyncer.Spec.Remote.ClusterConfig == nil || krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef == nil {
-		return nil, fmt.Errorf("KubeConfigSecretRef not specified")
-	}
-
-	secret := &corev1.Secret{}
-	key := client.ObjectKey{
-		Name:      krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef.Name,
-		Namespace: krmsyncer.Namespace, // Secret must be in the same namespace as Syncer
-	}
-	if err := r.LocalClient.Get(ctx, key, secret); err != nil {
-		return nil, err
-	}
-
-	kubeconfig, ok := secret.Data["kubeconfig"]
-	if !ok {
-		return nil, fmt.Errorf("secret %s does not contain 'kubeconfig' key", key.Name)
-	}
-
-	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	restConfig, err := r.RemoteConfigProvider.RESTConfig(ctx, krmsyncer.Spec.Remote)
 	if err != nil {
 		return nil, err
 	}
