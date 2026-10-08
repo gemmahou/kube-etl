@@ -67,9 +67,9 @@ make test-integration
   - `Default` (default): the cluster's default endpoint, the same one `gcloud container clusters get-credentials` uses.
   - `DNS`: the cluster's DNS-based endpoint (it must be enabled on the cluster). This works from anywhere with IAM-based access and needs no VPC connectivity.
   - `PrivateIP`: the cluster's private endpoint. The controller must have network connectivity to the cluster's VPC.
-- **Google identity for the controller**: The controller authenticates to the GKE API and the remote cluster with Application Default Credentials. On GKE, use [Workload Identity Federation for GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity) for the `krmsyncer-system/krmsyncer-controller-manager` Kubernetes service account. That identity needs:
-  - `container.clusters.get` on the remote cluster's project (e.g. `roles/container.clusterViewer`), to look up the cluster endpoint and CA.
-  - Kubernetes RBAC on the remote cluster to read (pull mode) or write (push mode) the synced resources.
+- **Google service account for the controller**: The controller authenticates to the GKE API and the remote cluster with Application Default Credentials. On GKE, the `krmsyncer-system/krmsyncer-controller-manager` Kubernetes service account must impersonate a Google service account (GSA) through [Workload Identity Federation for GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity) (see "Link Kubernetes ServiceAccounts to IAM").
+  - `container.clusters.get` on the remote cluster's project (e.g. `roles/container.clusterViewer`), the controller also uses it to look up the cluster endpoint and CA.
+  - Kubernetes RBAC on the remote cluster to read (pull mode) or write (push mode) the synced resources, bound to the GSA's email as a `User` subject.
 - **RBAC**: The operator needs permissions to read the resources defined in the rules and to manage `Syncer` resources.
 
 > [!WARNING]
@@ -93,14 +93,28 @@ go run main.go
 
 ### 3. Usage Example: Cross-Cluster Sync
 
-1. **Grant the controller access to the Remote cluster**:
+1. **Set up a Google service account for the controller** (in the Local cluster's project):
     ```bash
-    # Grant permission to look up the remote cluster (endpoint + CA).
+    gcloud iam service-accounts create krmsyncer --project=<LOCAL_PROJECT>
+
+    # Allow the controller's Kubernetes service account to impersonate the GSA.
+    gcloud iam service-accounts add-iam-policy-binding krmsyncer@<LOCAL_PROJECT>.iam.gserviceaccount.com \
+      --role=roles/iam.workloadIdentityUser \
+      --member="serviceAccount:<LOCAL_PROJECT>.svc.id.goog[krmsyncer-system/krmsyncer-controller-manager]"
+
+    kubectl annotate serviceaccount krmsyncer-controller-manager -n krmsyncer-system \
+      iam.gke.io/gcp-service-account=krmsyncer@<LOCAL_PROJECT>.iam.gserviceaccount.com
+    ```
+    Instead of `kubectl annotate`, you can set the annotation in [`config/rbac/service_account.yaml`](config/rbac/service_account.yaml) before deploying.
+
+1. **Grant the GSA access to the Remote cluster**:
+    ```bash
+    # Required to authenticate to the remote cluster and to look up its endpoint and CA.
     gcloud projects add-iam-policy-binding <REMOTE_PROJECT> \
       --role=roles/container.clusterViewer \
-      --member=principal://iam.googleapis.com/projects/<LOCAL_PROJECT_NUMBER>/locations/global/workloadIdentityPools/<LOCAL_PROJECT>.svc.id.goog/subject/ns/krmsyncer-system/sa/krmsyncer-controller-manager
+      --member=serviceAccount:krmsyncer@<LOCAL_PROJECT>.iam.gserviceaccount.com
     ```
-    Then grant the same principal Kubernetes RBAC on the Remote cluster for the resources being synced.
+    Then grant the GSA Kubernetes RBAC on the Remote cluster for the resources being synced, using its email as a `User` subject.
 
 1. **Apply the Syncer Resource** (on the Local cluster):
     ```yaml
