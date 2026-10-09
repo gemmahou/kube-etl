@@ -107,9 +107,7 @@ func (p *GKEConfigProvider) RESTConfig(ctx context.Context, remote *krmv1alpha1.
 	if err != nil {
 		return nil, fmt.Errorf("GKE cluster %s: %w", key, err)
 	}
-	cfg.WrapTransport = transport.Wrappers(cfg.WrapTransport, func(rt http.RoundTripper) http.RoundTripper {
-		return &oauth2.Transport{Source: ts, Base: rt}
-	})
+	cfg.Wrap(transport.TokenSourceWrapTransport(ts))
 	return cfg, nil
 }
 
