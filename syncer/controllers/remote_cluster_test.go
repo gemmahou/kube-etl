@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -89,8 +90,18 @@ func TestGKEConfigProvider(t *testing.T) {
 			http.Error(w, "unauthorized: "+got, http.StatusUnauthorized)
 			return
 		}
+		if got := r.Header.Get("User-Agent"); got != userAgent {
+			http.Error(w, "bad user agent: "+got, http.StatusBadRequest)
+			return
+		}
+		if got := r.URL.Query().Get("fields"); got != gkeClusterFields {
+			http.Error(w, "bad fields: "+got, http.StatusBadRequest)
+			return
+		}
 		if r.URL.Path != "/v1/projects/p/locations/us-central1/clusters/c" {
-			http.Error(w, "not found", http.StatusNotFound)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"error":{"code":404,"message":"Not found: projects/p/locations/us-central1/clusters/missing.","status":"NOT_FOUND"}}`)
 			return
 		}
 		fmt.Fprintf(w, `{"name":"c","endpoint":"1.2.3.4","masterAuth":{"clusterCaCertificate":%q}}`,
@@ -128,15 +139,27 @@ func TestGKEConfigProvider(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int32(1), calls.Load())
 
-	// API errors are surfaced.
+	// API errors surface the API's message, not the raw response body.
 	_, err = p.RESTConfig(ctx, "", gkeRemote("p", "us-central1", "missing"))
+	require.Error(t, err)
 	assert.ErrorContains(t, err, "404")
+	assert.ErrorContains(t, err, "Not found: projects/p/locations/us-central1/clusters/missing.")
+	assert.NotContains(t, err.Error(), `"status"`)
+}
+
+func TestGoogleAPIErrorMessage(t *testing.T) {
+	assert.Equal(t, "denied", googleAPIErrorMessage([]byte(`{"error":{"code":403,"message":"denied"}}`)))
+	assert.Equal(t, "plain text", googleAPIErrorMessage([]byte("  plain text\n")))
+
+	long := googleAPIErrorMessage([]byte(strings.Repeat("x", 1000)))
+	assert.Len(t, long, 256+len("..."))
+	assert.True(t, strings.HasSuffix(long, "..."))
 }
 
 func TestGKEConfigProviderEscapesPath(t *testing.T) {
 	var gotURI string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotURI = r.RequestURI
+		gotURI = r.URL.EscapedPath()
 		http.Error(w, "not found", http.StatusNotFound)
 	}))
 	defer srv.Close()

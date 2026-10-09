@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,6 +71,14 @@ var gkeAuthScopes = []string{
 	"https://www.googleapis.com/auth/userinfo.email",
 }
 
+const (
+	// gkeClusterFields limits the clusters.get response to the fields in
+	// gkeCluster, keeping it small.
+	gkeClusterFields = "endpoint,masterAuth.clusterCaCertificate,privateClusterConfig.privateEndpoint,controlPlaneEndpointsConfig"
+	// userAgent identifies the controller in GKE API requests.
+	userAgent = "kube-etl-krmsyncer"
+)
+
 // GKEConfigProvider resolves GKE clusters through the GKE API and
 // authenticates to them with Google credentials (Workload Identity / ADC).
 type GKEConfigProvider struct {
@@ -79,9 +88,9 @@ type GKEConfigProvider struct {
 	// ContainerAPIEndpoint is the GKE API endpoint. Defaults to
 	// https://container.googleapis.com.
 	ContainerAPIEndpoint string
-	// HTTPClient is the base client used to call the GKE API. Defaults to
-	// http.DefaultClient.
-	HTTPClient *http.Client
+	// Transport is the base transport used to call the GKE API. Defaults to
+	// http.DefaultTransport.
+	Transport http.RoundTripper
 
 	mu    sync.Mutex
 	ts    oauth2.TokenSource
@@ -242,9 +251,9 @@ func (p *GKEConfigProvider) fetchCluster(ctx context.Context, key string, ref *k
 	if endpoint == "" {
 		endpoint = defaultContainerAPIEndpoint
 	}
-	base := http.DefaultTransport
-	if p.HTTPClient != nil && p.HTTPClient.Transport != nil {
-		base = p.HTTPClient.Transport
+	base := p.Transport
+	if base == nil {
+		base = http.DefaultTransport
 	}
 	httpClient := &http.Client{
 		Transport: &oauth2.Transport{Source: ts, Base: base},
@@ -252,12 +261,14 @@ func (p *GKEConfigProvider) fetchCluster(ctx context.Context, key string, ref *k
 	}
 
 	// Escape each segment so user-provided values cannot alter the request path.
-	reqURL := fmt.Sprintf("%s/v1/projects/%s/locations/%s/clusters/%s", endpoint,
-		url.PathEscape(ref.Project), url.PathEscape(ref.Location), url.PathEscape(ref.Name))
+	reqURL := fmt.Sprintf("%s/v1/projects/%s/locations/%s/clusters/%s?%s", endpoint,
+		url.PathEscape(ref.Project), url.PathEscape(ref.Location), url.PathEscape(ref.Name),
+		url.Values{"fields": {gkeClusterFields}}.Encode())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("User-Agent", userAgent)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("getting GKE cluster %s: %w", key, err)
@@ -268,7 +279,7 @@ func (p *GKEConfigProvider) fetchCluster(ctx context.Context, key string, ref *k
 		return nil, fmt.Errorf("reading GKE cluster %s: %w", key, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("getting GKE cluster %s: %s: %s", key, resp.Status, body)
+		return nil, fmt.Errorf("getting GKE cluster %s: %s: %s", key, resp.Status, googleAPIErrorMessage(body))
 	}
 
 	c := &gkeCluster{}
@@ -276,4 +287,23 @@ func (p *GKEConfigProvider) fetchCluster(ctx context.Context, key string, ref *k
 		return nil, fmt.Errorf("decoding GKE cluster %s: %w", key, err)
 	}
 	return c, nil
+}
+
+// googleAPIErrorMessage extracts error.message from a Google API error
+// response, falling back to a trimmed copy of the body.
+func googleAPIErrorMessage(body []byte) string {
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &e); err == nil && e.Error.Message != "" {
+		return e.Error.Message
+	}
+	const maxLen = 256
+	msg := strings.TrimSpace(string(body))
+	if len(msg) > maxLen {
+		msg = msg[:maxLen] + "..."
+	}
+	return msg
 }
