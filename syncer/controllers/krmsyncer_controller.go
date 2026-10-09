@@ -54,7 +54,10 @@ type KRMSyncerReconciler struct {
 	WatchedRemoteGVKs map[RemoteGVK]bool
 	// RemoteClusters tracks the remote clusters being watched, keyed by RemoteConfigProvider.Key
 	RemoteClusters map[string]cluster.Cluster
-	mu             sync.RWMutex
+	// remoteClients caches Push mode destination clients, shared by all
+	// push watchers.
+	remoteClients *remoteClientCache
+	mu            sync.RWMutex
 }
 
 type RemoteGVK struct {
@@ -270,6 +273,7 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 		LocalClient:          r.Client,
 		RemoteClient:         r.Client,
 		RemoteConfigProvider: r.RemoteConfigProvider,
+		remoteClients:        r.remoteClients,
 		GVK:                  gvk,
 		Mode:                 krmv1alpha1.ModePush,
 	}
@@ -349,6 +353,7 @@ func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.WatchedGVKs = make(map[schema.GroupVersionKind]bool)
 	r.WatchedRemoteGVKs = make(map[RemoteGVK]bool)
 	r.RemoteClusters = make(map[string]cluster.Cluster)
+	r.remoteClients = newRemoteClientCache(r.RemoteConfigProvider)
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&krmv1alpha1.KRMSyncer{}).
 		Complete(r)
@@ -364,6 +369,9 @@ type DynamicResourceReconciler struct {
 	GVK                  schema.GroupVersionKind
 	Mode                 krmv1alpha1.Mode
 	Remote               RemoteGVK // Only used for Pull mode
+	// remoteClients caches destination clients (Push mode). If nil, a new
+	// client is built for every event.
+	remoteClients *remoteClientCache
 }
 
 func (r *DynamicResourceReconciler) ruleMatchesGVK(rule krmv1alpha1.ResourceRule, gvk schema.GroupVersionKind) bool {
@@ -503,6 +511,10 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 }
 
 func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
+	if r.remoteClients != nil {
+		return r.remoteClients.get(ctx, krmsyncer.Namespace, krmsyncer.Spec.Remote)
+	}
+
 	restConfig, err := r.RemoteConfigProvider.RESTConfig(ctx, krmsyncer.Namespace, krmsyncer.Spec.Remote)
 	if err != nil {
 		return nil, err
