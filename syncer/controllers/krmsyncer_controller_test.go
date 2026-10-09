@@ -406,6 +406,74 @@ func TestSyncerValidation(t *testing.T) {
 	assert.Equal(t, []string{"status"}, defaultSyncer.Spec.Rules[0].SyncFields)
 }
 
+func TestSyncerRemoteValidation(t *testing.T) {
+	ctx := t.Context()
+	ns := "default"
+
+	gkeCluster := func(extra map[string]any) map[string]any {
+		c := map[string]any{"project": "test-project", "location": "us-central1", "name": "dest"}
+		for k, v := range extra {
+			c[k] = v
+		}
+		return c
+	}
+
+	for _, tc := range []struct {
+		name    string
+		remote  any // nil omits spec.remote entirely
+		wantErr string
+	}{
+		{
+			name:    "no remote",
+			remote:  nil,
+			wantErr: "spec.remote: Required value",
+		},
+		{
+			name:    "invalid endpoint",
+			remote:  map[string]any{"gkeCluster": gkeCluster(map[string]any{"endpoint": "PublicIP"})},
+			wantErr: `spec.remote.gkeCluster.endpoint: Unsupported value: "PublicIP"`,
+		},
+		{
+			name:   "valid, endpoint defaulted",
+			remote: map[string]any{"gkeCluster": gkeCluster(nil)},
+		},
+		{
+			name:   "valid, DNS endpoint",
+			remote: map[string]any{"gkeCluster": gkeCluster(map[string]any{"endpoint": "DNS"})},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := map[string]any{
+				"mode":  "pull",
+				"rules": []any{map[string]any{"group": "", "version": "v1", "kind": "ConfigMap"}},
+			}
+			if tc.remote != nil {
+				spec["remote"] = tc.remote
+			}
+			u := &unstructured.Unstructured{Object: map[string]any{"spec": spec}}
+			u.SetGroupVersionKind(krmv1alpha1.GroupVersion.WithKind("KRMSyncer"))
+			u.SetGenerateName("remote-validation-")
+			u.SetNamespace(ns)
+			// Suspend so the controller does not try to connect to the remote.
+			require.NoError(t, unstructured.SetNestedField(u.Object, true, "spec", "suspend"))
+
+			err := k8sClientSource.Create(ctx, u)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				defer func() { _ = k8sClientSource.Delete(ctx, u) }()
+				endpoint, _, _ := unstructured.NestedString(u.Object, "spec", "remote", "gkeCluster", "endpoint")
+				if tc.name == "valid, endpoint defaulted" {
+					assert.Equal(t, string(krmv1alpha1.GKEEndpointDefault), endpoint)
+				}
+				return
+			}
+			require.Error(t, err)
+			assert.True(t, errors.IsInvalid(err), "expected Invalid, got %v", err)
+			assert.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
 func TestSyncerPull(t *testing.T) {
 	ctx := t.Context()
 	ns := "default"
