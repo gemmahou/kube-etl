@@ -32,14 +32,20 @@ import (
 	"k8s.io/client-go/transport"
 )
 
-// RemoteConfigProvider builds a rest.Config for the remote cluster of a KRMSyncer.
+// RemoteConfigProvider builds connections to the remote cluster of a KRMSyncer.
 type RemoteConfigProvider interface {
-	RESTConfig(ctx context.Context, remote *krmv1alpha1.RemoteConfig) (*rest.Config, error)
+	// Key identifies a connection. KRMSyncers with equal keys share a cached
+	// remote cluster (and its watches).
+	Key(namespace string, remote *krmv1alpha1.RemoteConfig) (string, error)
+	// RESTConfig returns a rest.Config for the remote cluster. namespace is the
+	// KRMSyncer's namespace, for remotes that read namespaced objects (e.g.
+	// Secrets).
+	RESTConfig(ctx context.Context, namespace string, remote *krmv1alpha1.RemoteConfig) (*rest.Config, error)
 }
 
-// remoteClusterKey returns a stable identifier for the remote cluster, used to
-// de-duplicate remote caches and watches across KRMSyncers.
-func remoteClusterKey(remote *krmv1alpha1.RemoteConfig) (string, error) {
+// gkeClusterName returns the GKE resource name of the remote cluster
+// (projects/p/locations/l/clusters/c). It keys the cluster lookup cache.
+func gkeClusterName(remote *krmv1alpha1.RemoteConfig) (string, error) {
 	if remote == nil || remote.GKECluster == nil {
 		return "", fmt.Errorf("spec.remote.gkeCluster must be set")
 	}
@@ -89,9 +95,24 @@ type cachedGKECluster struct {
 
 var _ RemoteConfigProvider = &GKEConfigProvider{}
 
+// Key implements RemoteConfigProvider. GKE connections do not depend on the
+// KRMSyncer's namespace; they are identified by the cluster and the endpoint.
+// So changing the endpoint creates a new connection: gke/projects/<p>/locations/<l>/clusters/<c>/<endpoint>.
+func (p *GKEConfigProvider) Key(_ string, remote *krmv1alpha1.RemoteConfig) (string, error) {
+	name, err := gkeClusterName(remote)
+	if err != nil {
+		return "", err
+	}
+	endpoint := remote.GKECluster.Endpoint
+	if endpoint == "" {
+		endpoint = krmv1alpha1.GKEEndpointDefault
+	}
+	return "gke/" + name + "/" + string(endpoint), nil
+}
+
 // RESTConfig implements RemoteConfigProvider.
-func (p *GKEConfigProvider) RESTConfig(ctx context.Context, remote *krmv1alpha1.RemoteConfig) (*rest.Config, error) {
-	key, err := remoteClusterKey(remote)
+func (p *GKEConfigProvider) RESTConfig(ctx context.Context, _ string, remote *krmv1alpha1.RemoteConfig) (*rest.Config, error) {
+	key, err := gkeClusterName(remote)
 	if err != nil {
 		return nil, err
 	}

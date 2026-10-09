@@ -33,8 +33,8 @@ func gkeRemote(project, location, name string) *krmv1alpha1.RemoteConfig {
 	return &krmv1alpha1.RemoteConfig{GKECluster: &krmv1alpha1.GKECluster{Project: project, Location: location, Name: name}}
 }
 
-func TestRemoteClusterKey(t *testing.T) {
-	key, err := remoteClusterKey(gkeRemote("p", "us-central1", "c"))
+func TestGKEClusterName(t *testing.T) {
+	key, err := gkeClusterName(gkeRemote("p", "us-central1", "c"))
 	require.NoError(t, err)
 	assert.Equal(t, "projects/p/locations/us-central1/clusters/c", key)
 
@@ -45,9 +45,37 @@ func TestRemoteClusterKey(t *testing.T) {
 		gkeRemote("p", "", "c"),
 		gkeRemote("p", "l", ""),
 	} {
-		_, err := remoteClusterKey(remote)
+		_, err := gkeClusterName(remote)
 		assert.Error(t, err, "remote %+v", remote)
 	}
+}
+
+func TestGKEConfigProviderKey(t *testing.T) {
+	p := &GKEConfigProvider{}
+	withEndpoint := func(e krmv1alpha1.GKEEndpoint) *krmv1alpha1.RemoteConfig {
+		r := gkeRemote("p", "us-central1", "c")
+		r.GKECluster.Endpoint = e
+		return r
+	}
+
+	unset, err := p.Key("ns1", withEndpoint(""))
+	require.NoError(t, err)
+	def, err := p.Key("ns1", withEndpoint(krmv1alpha1.GKEEndpointDefault))
+	require.NoError(t, err)
+	dns, err := p.Key("ns1", withEndpoint(krmv1alpha1.GKEEndpointDNS))
+	require.NoError(t, err)
+
+	assert.Equal(t, "gke/projects/p/locations/us-central1/clusters/c/Default", def)
+	assert.Equal(t, def, unset, "unset endpoint should match the Default endpoint")
+	assert.Equal(t, "gke/projects/p/locations/us-central1/clusters/c/DNS", dns)
+
+	// GKE connections do not depend on the KRMSyncer's namespace.
+	other, err := p.Key("ns2", withEndpoint(krmv1alpha1.GKEEndpointDefault))
+	require.NoError(t, err)
+	assert.Equal(t, def, other)
+
+	_, err = p.Key("ns1", nil)
+	assert.Error(t, err)
 }
 
 func TestGKEConfigProvider(t *testing.T) {
@@ -76,7 +104,7 @@ func TestGKEConfigProvider(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	cfg, err := p.RESTConfig(ctx, gkeRemote("p", "us-central1", "c"))
+	cfg, err := p.RESTConfig(ctx, "", gkeRemote("p", "us-central1", "c"))
 	require.NoError(t, err)
 	assert.Equal(t, "https://1.2.3.4", cfg.Host)
 	assert.Equal(t, caPEM, cfg.CAData)
@@ -96,12 +124,12 @@ func TestGKEConfigProvider(t *testing.T) {
 	assert.Equal(t, "Bearer "+token, gotAuth)
 
 	// Cluster info is cached.
-	_, err = p.RESTConfig(ctx, gkeRemote("p", "us-central1", "c"))
+	_, err = p.RESTConfig(ctx, "", gkeRemote("p", "us-central1", "c"))
 	require.NoError(t, err)
 	assert.Equal(t, int32(1), calls.Load())
 
 	// API errors are surfaced.
-	_, err = p.RESTConfig(ctx, gkeRemote("p", "us-central1", "missing"))
+	_, err = p.RESTConfig(ctx, "", gkeRemote("p", "us-central1", "missing"))
 	assert.ErrorContains(t, err, "404")
 }
 
@@ -117,7 +145,7 @@ func TestGKEConfigProviderEscapesPath(t *testing.T) {
 		TokenSource:          oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "t"}),
 		ContainerAPIEndpoint: srv.URL,
 	}
-	_, err := p.RESTConfig(context.Background(), gkeRemote("example.com:p", "us-central1", "../../other?x=1"))
+	_, err := p.RESTConfig(context.Background(), "", gkeRemote("example.com:p", "us-central1", "../../other?x=1"))
 	require.Error(t, err)
 	assert.Equal(t, "/v1/projects/example.com:p/locations/us-central1/clusters/..%2F..%2Fother%3Fx=1", gotURI)
 }

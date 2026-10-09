@@ -256,7 +256,12 @@ type staticConfigProvider struct {
 	cfg *rest.Config
 }
 
-func (p staticConfigProvider) RESTConfig(_ context.Context, remote *krmv1alpha1.RemoteConfig) (*rest.Config, error) {
+// Key uses the same connection key as the GKE provider.
+func (p staticConfigProvider) Key(namespace string, remote *krmv1alpha1.RemoteConfig) (string, error) {
+	return (&controllers.GKEConfigProvider{}).Key(namespace, remote)
+}
+
+func (p staticConfigProvider) RESTConfig(_ context.Context, _ string, remote *krmv1alpha1.RemoteConfig) (*rest.Config, error) {
 	if remote == nil || remote.GKECluster == nil {
 		return nil, fmt.Errorf("spec.remote.gkeCluster must be set")
 	}

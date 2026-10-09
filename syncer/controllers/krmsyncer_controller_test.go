@@ -63,8 +63,13 @@ type testConfigProvider struct {
 	clusters map[string]*rest.Config
 }
 
-func (p *testConfigProvider) RESTConfig(_ context.Context, remote *krmv1alpha1.RemoteConfig) (*rest.Config, error) {
-	if _, err := remoteClusterKey(remote); err != nil {
+// Key uses the same connection key as the GKE provider.
+func (p *testConfigProvider) Key(namespace string, remote *krmv1alpha1.RemoteConfig) (string, error) {
+	return (&GKEConfigProvider{}).Key(namespace, remote)
+}
+
+func (p *testConfigProvider) RESTConfig(_ context.Context, _ string, remote *krmv1alpha1.RemoteConfig) (*rest.Config, error) {
+	if _, err := gkeClusterName(remote); err != nil {
 		return nil, err
 	}
 	cfg, ok := p.clusters[remote.GKECluster.Name]

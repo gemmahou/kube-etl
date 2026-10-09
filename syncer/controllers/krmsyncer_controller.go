@@ -52,13 +52,13 @@ type KRMSyncerReconciler struct {
 	WatchedGVKs map[schema.GroupVersionKind]bool
 	// WatchedRemoteGVKs tracks which GVKs are already being watched on remote clusters
 	WatchedRemoteGVKs map[RemoteGVK]bool
-	// RemoteClusters tracks the remote clusters being watched, keyed by remote cluster key
+	// RemoteClusters tracks the remote clusters being watched, keyed by RemoteConfigProvider.Key
 	RemoteClusters map[string]cluster.Cluster
 	mu             sync.RWMutex
 }
 
 type RemoteGVK struct {
-	// Cluster is the remote cluster key (see remoteClusterKey).
+	// Cluster is the remote connection key (see RemoteConfigProvider.Key).
 	Cluster string
 	GVK     schema.GroupVersionKind
 }
@@ -124,7 +124,7 @@ func (r *KRMSyncerReconciler) getDiscoveryClient(ctx context.Context, krmsyncer 
 	}
 
 	// Pull mode
-	restConfig, err := r.RemoteConfigProvider.RESTConfig(ctx, krmsyncer.Spec.Remote)
+	restConfig, err := r.RemoteConfigProvider.RESTConfig(ctx, krmsyncer.Namespace, krmsyncer.Spec.Remote)
 	if err != nil {
 		return nil, fmt.Errorf("remote cluster config for Pull mode: %w", err)
 	}
@@ -233,13 +233,13 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 
 		for _, gvk := range gvks {
 			if mode == krmv1alpha1.ModePull {
-				clusterKey, err := remoteClusterKey(krmsyncer.Spec.Remote)
+				connKey, err := r.RemoteConfigProvider.Key(krmsyncer.Namespace, krmsyncer.Spec.Remote)
 				if err != nil {
 					logger.Error(err, "Cannot start remote watcher")
 					continue
 				}
 				rgvk := RemoteGVK{
-					Cluster: clusterKey,
+					Cluster: connKey,
 					GVK:     gvk,
 				}
 				if !r.WatchedRemoteGVKs[rgvk] {
@@ -284,17 +284,18 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 }
 
 func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer, rgvk RemoteGVK) error {
-	remoteCluster, err := r.getOrCreateRemoteCluster(ctx, rgvk.Cluster, krmsyncer.Spec.Remote)
+	remoteCluster, err := r.getOrCreateRemoteCluster(ctx, rgvk.Cluster, krmsyncer.Namespace, krmsyncer.Spec.Remote)
 	if err != nil {
 		return fmt.Errorf("failed to get remote cluster: %v", err)
 	}
 
 	dr := &DynamicResourceReconciler{
-		LocalClient:  r.Client,
-		RemoteClient: remoteCluster.GetClient(),
-		GVK:          rgvk.GVK,
-		Mode:         krmv1alpha1.ModePull,
-		Remote:       rgvk,
+		LocalClient:          r.Client,
+		RemoteClient:         remoteCluster.GetClient(),
+		RemoteConfigProvider: r.RemoteConfigProvider,
+		GVK:                  rgvk.GVK,
+		Mode:                 krmv1alpha1.ModePull,
+		Remote:               rgvk,
 	}
 
 	u := &unstructured.Unstructured{}
@@ -307,14 +308,14 @@ func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer 
 		Complete(dr)
 }
 
-func (r *KRMSyncerReconciler) getOrCreateRemoteCluster(ctx context.Context, key string, remote *krmv1alpha1.RemoteConfig) (cluster.Cluster, error) {
+func (r *KRMSyncerReconciler) getOrCreateRemoteCluster(ctx context.Context, key, namespace string, remote *krmv1alpha1.RemoteConfig) (cluster.Cluster, error) {
 	logger := log.FromContext(ctx)
 
 	if c, ok := r.RemoteClusters[key]; ok {
 		return c, nil
 	}
 
-	restConfig, err := r.RemoteConfigProvider.RESTConfig(ctx, remote)
+	restConfig, err := r.RemoteConfigProvider.RESTConfig(ctx, namespace, remote)
 	if err != nil {
 		return nil, err
 	}
@@ -357,7 +358,8 @@ func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 type DynamicResourceReconciler struct {
 	LocalClient  client.Client
 	RemoteClient client.Client
-	// RemoteConfigProvider builds the destination client config (Push mode only).
+	// RemoteConfigProvider builds the destination client config (Push mode) and
+	// derives connection keys to match KRMSyncers to this watcher (Pull mode).
 	RemoteConfigProvider RemoteConfigProvider
 	GVK                  schema.GroupVersionKind
 	Mode                 krmv1alpha1.Mode
@@ -416,8 +418,8 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		// For Pull mode, also check Remote match
 		if r.Mode == krmv1alpha1.ModePull {
-			clusterKey, err := remoteClusterKey(krmsyncer.Spec.Remote)
-			if err != nil || clusterKey != r.Remote.Cluster {
+			connKey, err := r.RemoteConfigProvider.Key(krmsyncer.Namespace, krmsyncer.Spec.Remote)
+			if err != nil || connKey != r.Remote.Cluster {
 				continue
 			}
 		}
@@ -501,7 +503,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 }
 
 func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
-	restConfig, err := r.RemoteConfigProvider.RESTConfig(ctx, krmsyncer.Spec.Remote)
+	restConfig, err := r.RemoteConfigProvider.RESTConfig(ctx, krmsyncer.Namespace, krmsyncer.Spec.Remote)
 	if err != nil {
 		return nil, err
 	}
