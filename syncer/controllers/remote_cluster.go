@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -98,7 +99,7 @@ func (p *GKEConfigProvider) RESTConfig(ctx context.Context, remote *krmv1alpha1.
 	if err != nil {
 		return nil, err
 	}
-	c, err := p.cluster(ctx, key, ts)
+	c, err := p.cluster(ctx, key, remote.GKECluster, ts)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +133,7 @@ func (p *GKEConfigProvider) tokenSource(ctx context.Context) (oauth2.TokenSource
 }
 
 // cluster returns the GKE cluster resource, using a short-lived cache.
-func (p *GKEConfigProvider) cluster(ctx context.Context, key string, ts oauth2.TokenSource) (*gkeCluster, error) {
+func (p *GKEConfigProvider) cluster(ctx context.Context, key string, ref *krmv1alpha1.GKECluster, ts oauth2.TokenSource) (*gkeCluster, error) {
 	p.mu.Lock()
 	if c, ok := p.cache[key]; ok && time.Since(c.fetchedAt) < gkeClusterTTL {
 		p.mu.Unlock()
@@ -140,7 +141,7 @@ func (p *GKEConfigProvider) cluster(ctx context.Context, key string, ts oauth2.T
 	}
 	p.mu.Unlock()
 
-	c, err := p.fetchCluster(ctx, key, ts)
+	c, err := p.fetchCluster(ctx, key, ref, ts)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +218,7 @@ func (c *gkeCluster) ipRESTConfig(host string) (*rest.Config, error) {
 	}, nil
 }
 
-func (p *GKEConfigProvider) fetchCluster(ctx context.Context, key string, ts oauth2.TokenSource) (*gkeCluster, error) {
+func (p *GKEConfigProvider) fetchCluster(ctx context.Context, key string, ref *krmv1alpha1.GKECluster, ts oauth2.TokenSource) (*gkeCluster, error) {
 	endpoint := p.ContainerAPIEndpoint
 	if endpoint == "" {
 		endpoint = defaultContainerAPIEndpoint
@@ -231,7 +232,10 @@ func (p *GKEConfigProvider) fetchCluster(ctx context.Context, key string, ts oau
 		Timeout:   30 * time.Second,
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/v1/"+key, nil)
+	// Escape each segment so user-provided values cannot alter the request path.
+	reqURL := fmt.Sprintf("%s/v1/projects/%s/locations/%s/clusters/%s", endpoint,
+		url.PathEscape(ref.Project), url.PathEscape(ref.Location), url.PathEscape(ref.Name))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}

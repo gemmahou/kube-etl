@@ -105,6 +105,23 @@ func TestGKEConfigProvider(t *testing.T) {
 	assert.ErrorContains(t, err, "404")
 }
 
+func TestGKEConfigProviderEscapesPath(t *testing.T) {
+	var gotURI string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURI = r.RequestURI
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	p := &GKEConfigProvider{
+		TokenSource:          oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "t"}),
+		ContainerAPIEndpoint: srv.URL,
+	}
+	_, err := p.RESTConfig(context.Background(), gkeRemote("example.com:p", "us-central1", "../../other?x=1"))
+	require.Error(t, err)
+	assert.Equal(t, "/v1/projects/example.com:p/locations/us-central1/clusters/..%2F..%2Fother%3Fx=1", gotURI)
+}
+
 func TestGKEClusterEndpoints(t *testing.T) {
 	caPEM := []byte("fake-ca")
 	ca := base64.StdEncoding.EncodeToString(caPEM)
