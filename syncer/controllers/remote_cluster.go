@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -298,8 +299,10 @@ func (p *GKEConfigProvider) fetchCluster(ctx context.Context, key string, ref *k
 	if err != nil {
 		return nil, fmt.Errorf("getting GKE cluster %s: %w", key, err)
 	}
-	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if closeErr := resp.Body.Close(); closeErr != nil {
+		err = errors.Join(err, closeErr)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("reading GKE cluster %s: %w", key, err)
 	}

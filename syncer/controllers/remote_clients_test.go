@@ -45,7 +45,7 @@ func (p *countingProvider) RESTConfig(_ context.Context, _ string, _ *krmv1alpha
 }
 
 func TestRemoteClientCache(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	p := &countingProvider{}
 	c := newRemoteClientCache(p)
 

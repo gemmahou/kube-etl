@@ -15,7 +15,6 @@
 package controllers
 
 import (
-	"context"
 	"encoding/base64"
 	"fmt"
 	"net/http"
@@ -126,7 +125,7 @@ func TestGKEConfigProvider(t *testing.T) {
 			}), nil
 		},
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	cfg, err := p.RESTConfig(ctx, "", gkeRemote("p", "us-central1", "c"))
 	require.NoError(t, err)
@@ -198,7 +197,7 @@ func TestGKEConfigProviderFollowsRotation(t *testing.T) {
 	}
 
 	// Build the config once, like the cached Pull/Push connections do.
-	cfg, err := p.RESTConfig(context.Background(), "", gkeRemote("p", "us-central1", "c"))
+	cfg, err := p.RESTConfig(t.Context(), "", gkeRemote("p", "us-central1", "c"))
 	require.NoError(t, err)
 	rt := cfg.WrapTransport(nil)
 	do := func() {
@@ -251,7 +250,7 @@ func TestGKEConfigProviderEscapesPath(t *testing.T) {
 		TokenSource:          oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "t"}),
 		ContainerAPIEndpoint: srv.URL,
 	}
-	_, err := p.RESTConfig(context.Background(), "", gkeRemote("example.com:p", "us-central1", "../../other?x=1"))
+	_, err := p.RESTConfig(t.Context(), "", gkeRemote("example.com:p", "us-central1", "../../other?x=1"))
 	require.Error(t, err)
 	assert.Equal(t, "/v1/projects/example.com:p/locations/us-central1/clusters/..%2F..%2Fother%3Fx=1", gotURI)
 }
