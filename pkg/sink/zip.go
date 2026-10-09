@@ -16,6 +16,7 @@ package sink
 
 import (
 	"archive/zip"
+	"errors"
 	"os"
 )
 
@@ -46,8 +47,7 @@ func (s *ZipSink) Write(path string, data []byte) error {
 
 func (s *ZipSink) Close() error {
 	if err := s.w.Close(); err != nil {
-		s.f.Close()
-		return err
+		return errors.Join(err, s.f.Close())
 	}
 	return s.f.Close()
 }
