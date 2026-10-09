@@ -61,7 +61,7 @@ func BuildExportCommand() *cobra.Command {
 	return cmd
 }
 
-func RunExport(ctx context.Context, opt ExportOptions) error {
+func RunExport(ctx context.Context, opt ExportOptions) (retErr error) {
 	if opt.Output == "" {
 		return fmt.Errorf("required flag(s) \"output\" not set")
 	}
@@ -70,7 +70,12 @@ func RunExport(ctx context.Context, opt ExportOptions) error {
 	if err != nil {
 		return fmt.Errorf("failed to create sink: %w", err)
 	}
-	defer s.Close()
+	// Closing the sink finalizes the zip archive, so its error matters.
+	defer func() {
+		if err := s.Close(); err != nil && retErr == nil {
+			retErr = fmt.Errorf("failed to close sink: %w", err)
+		}
+	}()
 
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	configOverrides := &clientcmd.ConfigOverrides{}
