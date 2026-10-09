@@ -208,7 +208,8 @@ func (c *gkeCluster) restConfig(endpoint krmv1alpha1.GKEEndpoint) (*rest.Config,
 	case krmv1alpha1.GKEEndpointDNS:
 		host := c.ControlPlaneEndpointsConfig.DNSEndpointConfig.Endpoint
 		if host == "" {
-			return nil, fmt.Errorf("DNS endpoint is not enabled")
+			return nil, fmt.Errorf("DNS endpoint is not enabled on the cluster; enable it with " +
+				"`gcloud container clusters update --enable-dns-access`, or set spec.remote.gkeCluster.endpoint to Default or PrivateIP")
 		}
 		// The DNS endpoint serves a publicly trusted certificate, so the
 		// system roots are used instead of the cluster CA.
@@ -220,13 +221,15 @@ func (c *gkeCluster) restConfig(endpoint krmv1alpha1.GKEEndpoint) (*rest.Config,
 			host = c.PrivateClusterConfig.PrivateEndpoint
 		}
 		if host == "" {
-			return nil, fmt.Errorf("cluster has no private endpoint")
+			return nil, fmt.Errorf("cluster has no private endpoint. IP access may be disabled, " +
+				"set spec.remote.gkeCluster.endpoint to DNS or Default")
 		}
 		return c.ipRESTConfig(host)
 
 	case krmv1alpha1.GKEEndpointDefault, "":
 		if c.Endpoint == "" {
-			return nil, fmt.Errorf("cluster has no endpoint")
+			return nil, fmt.Errorf("cluster has no IP endpoint. IP access may be disabled, " +
+				"set spec.remote.gkeCluster.endpoint to DNS")
 		}
 		return c.ipRESTConfig(c.Endpoint)
 

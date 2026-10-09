@@ -200,9 +200,9 @@ func TestGKEClusterEndpoints(t *testing.T) {
 		{name: "dns uses system roots", cluster: full, endpoint: krmv1alpha1.GKEEndpointDNS, wantHost: "https://gke-abc.us-central1.gke.goog"},
 		{name: "private ip (privateClusterConfig)", cluster: full, endpoint: krmv1alpha1.GKEEndpointPrivateIP, wantHost: "https://10.0.0.2", wantCA: caPEM},
 		{name: "private ip (ipEndpointsConfig)", cluster: newIPEndpoints, endpoint: krmv1alpha1.GKEEndpointPrivateIP, wantHost: "https://10.0.0.3", wantCA: caPEM},
-		{name: "dns not enabled", cluster: newIPEndpoints, endpoint: krmv1alpha1.GKEEndpointDNS, wantErr: "DNS endpoint is not enabled"},
-		{name: "no default endpoint", cluster: newIPEndpoints, endpoint: krmv1alpha1.GKEEndpointDefault, wantErr: "no endpoint"},
-		{name: "no private endpoint", cluster: &gkeCluster{}, endpoint: krmv1alpha1.GKEEndpointPrivateIP, wantErr: "no private endpoint"},
+		{name: "dns not enabled", cluster: newIPEndpoints, endpoint: krmv1alpha1.GKEEndpointDNS, wantErr: "--enable-dns-access"},
+		{name: "no default endpoint", cluster: newIPEndpoints, endpoint: krmv1alpha1.GKEEndpointDefault, wantErr: "cluster has no IP endpoint"},
+		{name: "no private endpoint", cluster: &gkeCluster{}, endpoint: krmv1alpha1.GKEEndpointPrivateIP, wantErr: "set spec.remote.gkeCluster.endpoint to DNS or Default"},
 		{name: "unknown", cluster: full, endpoint: "Bogus", wantErr: "unsupported endpoint"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
