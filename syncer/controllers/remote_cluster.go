@@ -60,7 +60,10 @@ func gkeClusterName(remote *krmv1alpha1.RemoteConfig) (string, error) {
 const (
 	defaultContainerAPIEndpoint = "https://container.googleapis.com"
 	// gkeClusterTTL bounds how long a fetched cluster (endpoints/CA) is reused
-	// before it is fetched again (e.g. to pick up CA rotation).
+	// before it is fetched again. Connections built by GKEConfigProvider use
+	// rotatingTransport, which picks up a changed endpoint or CA (e.g. after a
+	// credential rotation) within this interval, so cached Pull and Push
+	// connections keep working without a restart.
 	gkeClusterTTL = 10 * time.Minute
 )
 
@@ -95,6 +98,12 @@ type GKEConfigProvider struct {
 	mu    sync.Mutex
 	ts    oauth2.TokenSource
 	cache map[string]cachedGKECluster
+
+	// ttl overrides gkeClusterTTL (tests only).
+	ttl time.Duration
+	// clusterTransport builds the transport to a cluster's API server for a
+	// given CA (tests only). Defaults to a client-go TLS transport.
+	clusterTransport func(caData []byte) (http.RoundTripper, error)
 }
 
 type cachedGKECluster struct {
@@ -137,6 +146,15 @@ func (p *GKEConfigProvider) RESTConfig(ctx context.Context, _ string, remote *kr
 	if err != nil {
 		return nil, fmt.Errorf("GKE cluster %s: %w", key, err)
 	}
+
+	// Replace client-go's TLS transport (built once from cfg.CAData) with one
+	// that follows the cluster's current endpoint and CA, then add the Google
+	// OAuth token on top.
+	rt := &rotatingTransport{p: p, key: key, ref: *remote.GKECluster, ts: ts}
+	if err := rt.update(cfg); err != nil {
+		return nil, fmt.Errorf("GKE cluster %s: %w", key, err)
+	}
+	cfg.Wrap(func(http.RoundTripper) http.RoundTripper { return rt })
 	cfg.Wrap(transport.TokenSourceWrapTransport(ts))
 	return cfg, nil
 }
@@ -163,7 +181,7 @@ func (p *GKEConfigProvider) tokenSource(ctx context.Context) (oauth2.TokenSource
 // cluster returns the GKE cluster resource, using a short-lived cache.
 func (p *GKEConfigProvider) cluster(ctx context.Context, key string, ref *krmv1alpha1.GKECluster, ts oauth2.TokenSource) (*gkeCluster, error) {
 	p.mu.Lock()
-	if c, ok := p.cache[key]; ok && time.Since(c.fetchedAt) < gkeClusterTTL {
+	if c, ok := p.cache[key]; ok && time.Since(c.fetchedAt) < p.clusterTTL() {
 		p.mu.Unlock()
 		return c.cluster, nil
 	}
@@ -195,6 +213,9 @@ type gkeCluster struct {
 	ControlPlaneEndpointsConfig struct {
 		DNSEndpointConfig struct {
 			Endpoint string `json:"endpoint"`
+			// AllowExternalTraffic is whether user traffic is accepted on
+			// the DNS endpoint (set by --enable-dns-access).
+			AllowExternalTraffic *bool `json:"allowExternalTraffic"`
 		} `json:"dnsEndpointConfig"`
 		IPEndpointsConfig struct {
 			PrivateEndpoint string `json:"privateEndpoint"`
@@ -206,9 +227,10 @@ type gkeCluster struct {
 func (c *gkeCluster) restConfig(endpoint krmv1alpha1.GKEEndpoint) (*rest.Config, error) {
 	switch endpoint {
 	case krmv1alpha1.GKEEndpointDNS:
-		host := c.ControlPlaneEndpointsConfig.DNSEndpointConfig.Endpoint
-		if host == "" {
-			return nil, fmt.Errorf("DNS endpoint is not enabled on the cluster; enable it with " +
+		dns := c.ControlPlaneEndpointsConfig.DNSEndpointConfig
+		host := dns.Endpoint
+		if host == "" || dns.AllowExternalTraffic == nil || !*dns.AllowExternalTraffic {
+			return nil, fmt.Errorf("DNS endpoint is not enabled for external traffic on the cluster; enable it with " +
 				"`gcloud container clusters update --enable-dns-access`, or set spec.remote.gkeCluster.endpoint to Default or PrivateIP")
 		}
 		// The DNS endpoint serves a publicly trusted certificate, so the

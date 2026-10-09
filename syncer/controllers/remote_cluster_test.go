@@ -21,8 +21,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
@@ -109,9 +111,20 @@ func TestGKEConfigProvider(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	// Capture requests to the cluster API server instead of dialing it.
+	var gotAuth, gotHost string
+	var gotCA []byte
 	p := &GKEConfigProvider{
 		TokenSource:          oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token}),
 		ContainerAPIEndpoint: srv.URL,
+		clusterTransport: func(caData []byte) (http.RoundTripper, error) {
+			gotCA = caData
+			return roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				gotAuth = r.Header.Get("Authorization")
+				gotHost = r.URL.Host
+				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: r}, nil
+			}), nil
+		},
 	}
 	ctx := context.Background()
 
@@ -122,17 +135,16 @@ func TestGKEConfigProvider(t *testing.T) {
 	assert.Nil(t, cfg.ExecProvider)
 	require.NotNil(t, cfg.WrapTransport)
 
-	// The transport injects the Google OAuth token into requests to the cluster.
-	var gotAuth string
-	rt := cfg.WrapTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
-		gotAuth = r.Header.Get("Authorization")
-		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: r}, nil
-	}))
+	// Requests go to the cluster endpoint, trust the cluster CA and carry the
+	// Google OAuth token.
+	rt := cfg.WrapTransport(nil)
 	req, err := http.NewRequest(http.MethodGet, "https://1.2.3.4/api", nil)
 	require.NoError(t, err)
 	_, err = rt.RoundTrip(req)
 	require.NoError(t, err)
 	assert.Equal(t, "Bearer "+token, gotAuth)
+	assert.Equal(t, "1.2.3.4", gotHost)
+	assert.Equal(t, caPEM, gotCA)
 
 	// Cluster info is cached.
 	_, err = p.RESTConfig(ctx, "", gkeRemote("p", "us-central1", "c"))
@@ -145,6 +157,77 @@ func TestGKEConfigProvider(t *testing.T) {
 	assert.ErrorContains(t, err, "404")
 	assert.ErrorContains(t, err, "Not found: projects/p/locations/us-central1/clusters/missing.")
 	assert.NotContains(t, err.Error(), `"status"`)
+}
+
+func TestGKEConfigProviderFollowsRotation(t *testing.T) {
+	type state struct {
+		endpoint string
+		ca       string
+		fail     bool
+	}
+	var mu sync.Mutex
+	cur := state{endpoint: "1.1.1.1", ca: "ca-A"}
+	setState := func(s state) { mu.Lock(); cur = s; mu.Unlock() }
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		s := cur
+		mu.Unlock()
+		if s.fail {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprintf(w, `{"endpoint":%q,"masterAuth":{"clusterCaCertificate":%q}}`,
+			s.endpoint, base64.StdEncoding.EncodeToString([]byte(s.ca)))
+	}))
+	defer srv.Close()
+
+	var transportsBuilt []string
+	var gotHost string
+	p := &GKEConfigProvider{
+		TokenSource:          oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "t"}),
+		ContainerAPIEndpoint: srv.URL,
+		ttl:                  time.Nanosecond, // re-fetch the cluster on every request
+		clusterTransport: func(caData []byte) (http.RoundTripper, error) {
+			transportsBuilt = append(transportsBuilt, string(caData))
+			return roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				gotHost = r.URL.Host
+				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: r}, nil
+			}), nil
+		},
+	}
+
+	// Build the config once, like the cached Pull/Push connections do.
+	cfg, err := p.RESTConfig(context.Background(), "", gkeRemote("p", "us-central1", "c"))
+	require.NoError(t, err)
+	rt := cfg.WrapTransport(nil)
+	do := func() {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, cfg.Host+"/api", nil)
+		require.NoError(t, err)
+		_, err = rt.RoundTrip(req)
+		require.NoError(t, err)
+	}
+
+	do()
+	assert.Equal(t, "1.1.1.1", gotHost)
+	assert.Equal(t, []string{"ca-A"}, transportsBuilt)
+
+	// Unchanged settings reuse the transport.
+	do()
+	assert.Equal(t, []string{"ca-A"}, transportsBuilt)
+
+	// After a credential rotation (new IP and CA), the same connection follows.
+	setState(state{endpoint: "2.2.2.2", ca: "ca-B"})
+	do()
+	assert.Equal(t, "2.2.2.2", gotHost)
+	assert.Equal(t, []string{"ca-A", "ca-B"}, transportsBuilt)
+
+	// If the GKE API is unavailable, the last known settings are kept.
+	setState(state{fail: true})
+	do()
+	assert.Equal(t, "2.2.2.2", gotHost)
+	assert.Equal(t, []string{"ca-A", "ca-B"}, transportsBuilt)
 }
 
 func TestGoogleAPIErrorMessage(t *testing.T) {
@@ -182,6 +265,13 @@ func TestGKEClusterEndpoints(t *testing.T) {
 	full.MasterAuth.ClusterCACertificate = ca
 	full.PrivateClusterConfig.PrivateEndpoint = "10.0.0.2"
 	full.ControlPlaneEndpointsConfig.DNSEndpointConfig.Endpoint = "gke-abc.us-central1.gke.goog"
+	allow := true
+	full.ControlPlaneEndpointsConfig.DNSEndpointConfig.AllowExternalTraffic = &allow
+
+	dnsNoExternal := &gkeCluster{}
+	dnsNoExternal.ControlPlaneEndpointsConfig.DNSEndpointConfig.Endpoint = "gke-abc.us-central1.gke.goog"
+	deny := false
+	dnsNoExternal.ControlPlaneEndpointsConfig.DNSEndpointConfig.AllowExternalTraffic = &deny
 
 	newIPEndpoints := &gkeCluster{}
 	newIPEndpoints.MasterAuth.ClusterCACertificate = ca
@@ -201,6 +291,7 @@ func TestGKEClusterEndpoints(t *testing.T) {
 		{name: "private ip (privateClusterConfig)", cluster: full, endpoint: krmv1alpha1.GKEEndpointPrivateIP, wantHost: "https://10.0.0.2", wantCA: caPEM},
 		{name: "private ip (ipEndpointsConfig)", cluster: newIPEndpoints, endpoint: krmv1alpha1.GKEEndpointPrivateIP, wantHost: "https://10.0.0.3", wantCA: caPEM},
 		{name: "dns not enabled", cluster: newIPEndpoints, endpoint: krmv1alpha1.GKEEndpointDNS, wantErr: "--enable-dns-access"},
+		{name: "dns external traffic disabled", cluster: dnsNoExternal, endpoint: krmv1alpha1.GKEEndpointDNS, wantErr: "not enabled for external traffic"},
 		{name: "no default endpoint", cluster: newIPEndpoints, endpoint: krmv1alpha1.GKEEndpointDefault, wantErr: "cluster has no IP endpoint"},
 		{name: "no private endpoint", cluster: &gkeCluster{}, endpoint: krmv1alpha1.GKEEndpointPrivateIP, wantErr: "set spec.remote.gkeCluster.endpoint to DNS or Default"},
 		{name: "unknown", cluster: full, endpoint: "Bogus", wantErr: "unsupported endpoint"},
