@@ -97,10 +97,49 @@ The controller runs in the destination cluster and calls the source cluster's co
 | `Default` | The source's IP endpoint must accept the destination's traffic. If it's the public endpoint, add the destination's egress IPs (e.g. its Cloud NAT addresses) to the source's [authorized networks](https://cloud.google.com/kubernetes-engine/docs/how-to/authorized-networks). If the cluster only exposes its private endpoint, the `PrivateIP` requirements apply. |
 
 > [!NOTE]
-> **Config Controller as the source.** Config Controller clusters (`krmapihost-*`) are private clusters with a public endpoint enabled (authorized networks `0.0.0.0/0`, access still gated by IAM), control plane global access off, and DNS external traffic off. In practice:
-> - Use `--source-endpoint Default` (the public endpoint). It works from any region and VPC as long as the destination's nodes have internet egress (public IPs or Cloud NAT).
-> - Use `--source-endpoint PrivateIP` only if the destination cluster is in the same region and on the same VPC as the Config Controller instance (by default the `default` network of its project) or a connected VPC; cross-region connections to the private endpoint time out.
+> **Config Controller as the source.** Config Controller clusters (`krmapihost-*`) are private clusters that, by default, also have a public endpoint, control plane global access off, and DNS external traffic off. In practice:
+> - Use `--source-endpoint Default` (the public endpoint). It works from any region and VPC.
+> - Use `--source-endpoint PrivateIP` only if the destination cluster is in the same region and on the same VPC as the source cluster. Cross-region connections to the private endpoint time out.
 > - `--source-endpoint DNS` requires enabling DNS access on the managed cluster, which may not be permitted.
+>
+> If the source was created with `--use-private-endpoint`, it has no public endpoint; see [Private-only Config Controller](#private-only-config-controller).
+
+#### Private-only Config Controller
+
+A Config Controller cluster created with `--use-private-endpoint` is reachable only at its private endpoint, an internal IP in the source's VPC subnet. Its network settings are fixed when it is created, so the destination cluster has to be created to fit them. Use `--source-endpoint PrivateIP`.
+
+First, read the source's settings:
+```bash
+gcloud container clusters describe <SOURCE_CLUSTER_NAME> --location <SOURCE_CLUSTER_LOCATION> --project <SOURCE_PROJECT_ID> \
+  --format="yaml(location, network, privateClusterConfig.privateEndpoint, masterAuthorizedNetworksConfig.cidrBlocks)"
+```
+
+Then create the destination cluster so that:
+
+1. **Region:** it is in the source's `location`. The source has control plane global access off, so connections from other regions time out, even over the same VPC, VPC peering, Cloud VPN or Interconnect.
+2. **Network:** it is on the source's `network`. For a destination in another project, use [Shared VPC](https://cloud.google.com/vpc/docs/shared-vpc) and pass the host project's network and subnet.
+3. **IP ranges:** its node subnet range and Pod range fall inside the source's `masterAuthorizedNetworksConfig.cidrBlocks`. Authorized networks are enforced on the private endpoint, and the control plane sees the Pods' own IPs (GKE does not SNAT Pod traffic to internal ranges). With the default `0.0.0.0/0`, any range works; otherwise pick unused ranges inside the listed blocks. If no free range fits, the destination can't reach the source.
+4. **Workload Identity:** it is enabled (`--workload-pool`), which the controller needs to authenticate.
+
+For example:
+```bash
+gcloud container clusters create <DEST_CLUSTER_NAME> --project <DEST_PROJECT_ID> \
+  --location <SOURCE_CLUSTER_LOCATION> \
+  --network <SOURCE_NETWORK> --subnetwork <SUBNET_IN_SOURCE_REGION> \
+  --enable-ip-alias --cluster-ipv4-cidr <POD_RANGE_INSIDE_AUTHORIZED_BLOCKS> \
+  --workload-pool <DEST_PROJECT_ID>.svc.id.goog
+```
+
+Also check:
+- **Firewall:** egress within a VPC is allowed by default. If your organization adds egress deny rules, allow TCP 443 from the destination's node and Pod ranges to the private endpoint.
+- **Google APIs:** the controller still calls `container.googleapis.com` and the Workload Identity token endpoints. If the destination's nodes have no internet egress (private nodes without Cloud NAT), enable [Private Google Access](https://cloud.google.com/vpc/docs/private-google-access) on their subnet:
+  ```bash
+  gcloud compute networks subnets update <DEST_SUBNET> --region <SOURCE_CLUSTER_LOCATION> --enable-private-ip-google-access
+  ```
+
+If the destination must run in a different region, it can't reach a private-only source directly.
+
+#### Inspecting endpoints and testing reachability
 
 Inspect the source cluster's endpoints and access settings with:
 ```bash
