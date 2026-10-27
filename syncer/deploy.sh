@@ -566,8 +566,13 @@ render_manifests() {
 
 # check_build sets GO_VERSION and checks that Docker can build the image.
 check_build() {
-  GO_VERSION="$(awk '$1 == "go" && NF == 2 { print $2 }' "${MODULE_DIR}/go.mod")"
-  [[ -n "${GO_VERSION}" ]] || die "no go directive found in ${MODULE_DIR}/go.mod"
+  # Build with the toolchain directive, the Go release the syncer is built with. The go
+  # directive is only the minimum version for importers, so it's the fallback.
+  GO_VERSION="$(awk '$1 == "toolchain" && NF == 2 { sub(/^go/, "", $2); print $2 }' "${MODULE_DIR}/go.mod")"
+  if [[ -z "${GO_VERSION}" ]]; then
+    GO_VERSION="$(awk '$1 == "go" && NF == 2 { print $2 }' "${MODULE_DIR}/go.mod")"
+  fi
+  [[ -n "${GO_VERSION}" ]] || die "no toolchain or go directive found in ${MODULE_DIR}/go.mod"
   docker info >/dev/null 2>&1 || die "cannot connect to the Docker daemon; is it running?"
 }
 

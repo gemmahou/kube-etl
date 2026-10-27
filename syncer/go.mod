@@ -1,6 +1,11 @@
 module github.com/gke-labs/kube-etl/syncer
 
-go 1.27.2
+// The go directive is the minimum Go version for modules that import this one,
+// such as Config Connector, so raise it only when the code or a dependency needs it.
+// The toolchain directive is the Go release used to build the syncer (see deploy.sh).
+go 1.26.0
+
+toolchain go1.27.3
 
 require (
 	github.com/prometheus/client_golang v1.22.0

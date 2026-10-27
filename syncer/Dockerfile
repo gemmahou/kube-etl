@@ -13,8 +13,8 @@
 # limitations under the License.
 
 # Build the manager binary
-# GO_VERSION should match the `go` directive in go.mod.
-ARG GO_VERSION=1.27.0
+# GO_VERSION should match the `toolchain` directive in go.mod (deploy.sh passes it).
+ARG GO_VERSION=1.27.3
 FROM golang:${GO_VERSION} as builder
 
 WORKDIR /workspace
