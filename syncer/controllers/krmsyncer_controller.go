@@ -61,7 +61,10 @@ type KRMSyncerReconciler struct {
 	// SyncPeriod determines the minimum frequency at which watched resources are reconciled
 	// in remote cluster caches.
 	SyncPeriod *time.Duration
-	mu         sync.RWMutex
+	// setupFailures tracks KRMSyncers whose latest setup attempt failed, reported in
+	// syncer_setup_failed.
+	setupFailures *failureTracker
+	mu            sync.RWMutex
 }
 
 type RemoteGVK struct {
@@ -80,6 +83,10 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// Fetch the KRMSyncer instance
 	var krmSyncer krmv1alpha1.KRMSyncer
 	if err := r.Get(ctx, req.NamespacedName, &krmSyncer); err != nil {
+		if errors.IsNotFound(err) {
+			// A deleted KRMSyncer is no longer failing.
+			r.setupFailures.markSucceeded(req.NamespacedName)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -97,6 +104,8 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			Reason:  "SuspendedBySpec",
 			Message: "Controller is suspended",
 		})
+		// A suspended KRMSyncer is not set up, so it is not failing either.
+		r.setupFailures.markSucceeded(req.NamespacedName)
 		// Wait for the source cluster to push resources to us.
 		logger.Info("Sync suspended. Waiting for updates from active cluster...")
 		return ctrl.Result{}, nil
@@ -190,11 +199,22 @@ func (r *KRMSyncerReconciler) expandRule(ctx context.Context, krmsyncer *krmv1al
 	}}, nil
 }
 
-func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (ctrl.Result, error) {
+func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (_ ctrl.Result, retErr error) {
 	logger := log.FromContext(ctx)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// Report whether this setup attempt failed in syncer_setup_failed. A failed setup
+	// is requeued with backoff by returning the error.
+	key := client.ObjectKeyFromObject(krmsyncer)
+	defer func() {
+		if retErr != nil {
+			r.setupFailures.markFailed(key)
+		} else {
+			r.setupFailures.markSucceeded(key)
+		}
+	}()
 
 	mode := krmsyncer.Spec.Mode
 	if mode == "" {
@@ -225,6 +245,7 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 		}
 	}
 
+	var setupErrs []error
 	for _, rule := range krmsyncer.Spec.Rules {
 		gvks, err := r.expandRule(ctx, krmsyncer, rule, mode, resourceLists)
 		if err != nil {
@@ -243,6 +264,7 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 				connKey, err := r.RemoteConfigProvider.Key(krmsyncer.Namespace, krmsyncer.Spec.Remote)
 				if err != nil {
 					logger.Error(err, "Cannot start remote watcher")
+					setupErrs = append(setupErrs, err)
 					continue
 				}
 				rgvk := RemoteGVK{
@@ -252,6 +274,7 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 				if !r.WatchedRemoteGVKs[rgvk] {
 					if err := r.startRemoteWatcher(ctx, krmsyncer, rgvk); err != nil {
 						logger.Error(err, "Failed to start remote watcher for GVK", "gvk", gvk)
+						setupErrs = append(setupErrs, fmt.Errorf("watch %s: %w", gvk, err))
 						continue
 					}
 					r.WatchedRemoteGVKs[rgvk] = true
@@ -261,6 +284,7 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 				if !r.WatchedGVKs[gvk] {
 					if err := r.startWatcher(ctx, gvk); err != nil {
 						logger.Error(err, "Failed to start watcher for GVK", "gvk", gvk)
+						setupErrs = append(setupErrs, fmt.Errorf("watch %s: %w", gvk, err))
 						continue
 					}
 					r.WatchedGVKs[gvk] = true
@@ -269,7 +293,9 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 		}
 	}
 
-	return ctrl.Result{}, nil
+	// Failed watches are retried with backoff by returning the error. Watches that
+	// started are not restarted.
+	return ctrl.Result{}, stderrors.Join(setupErrs...)
 }
 
 func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.GroupVersionKind) error {
@@ -280,6 +306,7 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 		remoteClients:        r.remoteClients,
 		GVK:                  gvk,
 		Mode:                 krmv1alpha1.ModePush,
+		failures:             newFailureTracker(failedObjectsGauge(gvk)),
 	}
 
 	u := &unstructured.Unstructured{}
@@ -304,6 +331,7 @@ func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer 
 		GVK:                  rgvk.GVK,
 		Mode:                 krmv1alpha1.ModePull,
 		Remote:               rgvk,
+		failures:             newFailureTracker(failedObjectsGauge(rgvk.GVK)),
 	}
 
 	u := &unstructured.Unstructured{}
@@ -361,6 +389,7 @@ func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.WatchedRemoteGVKs = make(map[RemoteGVK]bool)
 	r.RemoteClusters = make(map[string]cluster.Cluster)
 	r.remoteClients = newRemoteClientCache(r.RemoteConfigProvider)
+	r.setupFailures = newFailureTracker(SetupFailed)
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&krmv1alpha1.KRMSyncer{}).
 		Complete(r)
@@ -379,6 +408,9 @@ type DynamicResourceReconciler struct {
 	// remoteClients caches destination clients (Push mode). If nil, a new
 	// client is built for every event.
 	remoteClients *remoteClientCache
+	// failures tracks objects whose latest sync attempt failed, reported in
+	// syncer_failed_objects. May be nil.
+	failures *failureTracker
 }
 
 func (r *DynamicResourceReconciler) ruleMatchesGVK(rule krmv1alpha1.ResourceRule, gvk schema.GroupVersionKind) bool {
@@ -407,6 +439,8 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if client.IgnoreNotFound(err) == nil {
 			isDeleted = true
 		} else {
+			// The object cannot be synced if it cannot be read from the source.
+			r.failures.markFailed(req.NamespacedName)
 			return ctrl.Result{}, err
 		}
 	}
@@ -486,7 +520,6 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					if !errors.IsNotFound(err) {
 						// TODO: report failure in syncer status
 						logger.Error(err, "Failed to delete resource on destination cluster")
-						recordSyncFailure(r.GVK, OperationDelete)
 						syncErrors = append(syncErrors, err)
 					}
 				}
@@ -520,7 +553,12 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 		}
 	}
-	return ctrl.Result{}, stderrors.Join(syncErrors...)
+	if len(syncErrors) > 0 {
+		r.failures.markFailed(req.NamespacedName)
+		return ctrl.Result{}, stderrors.Join(syncErrors...)
+	}
+	r.failures.markSucceeded(req.NamespacedName)
+	return ctrl.Result{}, nil
 }
 
 func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
@@ -590,11 +628,9 @@ func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, dest
 					},
 				}
 				if err := destClient.Create(ctx, ns); err != nil {
-					recordSyncFailure(r.GVK, OperationApply)
 					return fmt.Errorf("failed to create destination namespace %q: %v", nsName, err)
 				}
 			} else {
-				recordSyncFailure(r.GVK, OperationApply)
 				return fmt.Errorf("failed to check destination namespace %q: %v", nsName, err)
 			}
 		}
@@ -606,13 +642,11 @@ func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, dest
 
 	status, found, err := unstructured.NestedFieldCopy(obj.Object, "status")
 	if err != nil {
-		recordSyncFailure(r.GVK, OperationApply)
 		return fmt.Errorf("failed to copy status: %v", err)
 	}
 
 	// Use Server-Side Apply (SSA) to create or update the resource.
 	if err := destClient.Patch(ctx, obj, client.Apply, patchOpts...); err != nil {
-		recordSyncFailure(r.GVK, OperationApply)
 		return fmt.Errorf("failed to apply object to destination: %v", err)
 	}
 
@@ -634,7 +668,6 @@ func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, dest
 			client.FieldOwner("krm-syncer"),
 		}
 		if err := destClient.Status().Patch(ctx, statusObj, client.Apply, subResourcePatchOpts...); err != nil {
-			recordSyncFailure(r.GVK, OperationStatus)
 			return fmt.Errorf("failed to apply status subresource to destination: %v", err)
 		}
 	}
