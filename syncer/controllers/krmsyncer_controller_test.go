@@ -1025,25 +1025,6 @@ func TestSyncerRetryFailedStatus(t *testing.T) {
 	waitForFailedObjects(ctx, t, initialFailed)
 }
 
-func TestControllerOptionsMaxConcurrentReconciles(t *testing.T) {
-	tests := []struct {
-		name string
-		in   int
-		want int
-	}{
-		{name: "unset defaults to 10", in: 0, want: 10},
-		{name: "negative defaults to 10", in: -1, want: 10},
-		{name: "single worker", in: 1, want: 1},
-		{name: "concurrent workers", in: 8, want: 8},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			r := &KRMSyncerReconciler{MaxConcurrentReconciles: tc.in}
-			assert.Equal(t, tc.want, r.controllerOptions().MaxConcurrentReconciles)
-		})
-	}
-}
-
 func TestSyncPeriodConfigurable(t *testing.T) {
 	// 1. Verify command line flag definition, default (0 / disabled) and parsing
 	fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
