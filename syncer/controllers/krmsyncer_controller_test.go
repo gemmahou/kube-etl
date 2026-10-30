@@ -805,7 +805,7 @@ func TestSyncerRetryFailedApply(t *testing.T) {
 	faultInjector.failPatch.Store(true)
 	defer faultInjector.failPatch.Store(false)
 
-	initialFailures := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationApply))
+	initialFailed := testutil.ToFloat64(FailedObjects.WithLabelValues("", "v1", "Service"))
 
 	// Create Syncer targeting dest-retry
 	syncer := &krmv1alpha1.KRMSyncer{
@@ -837,10 +837,9 @@ func TestSyncerRetryFailedApply(t *testing.T) {
 
 	// Wait until failure metric has incremented
 	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
-		current := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationApply))
-		return current > initialFailures, nil
+		return testutil.ToFloat64(FailedObjects.WithLabelValues("", "v1", "Service")) > initialFailed, nil
 	})
-	require.NoError(t, err, "Failure metric for apply should increment on failure")
+	require.NoError(t, err, "Failed objects gauge should count the object while apply is failing")
 
 	// Verify target service does NOT exist in destination yet
 	destSvc := &corev1.Service{}
@@ -859,6 +858,7 @@ func TestSyncerRetryFailedApply(t *testing.T) {
 		return len(destSvc.Spec.Ports) > 0 && destSvc.Spec.Ports[0].Port == 80, nil
 	})
 	assert.NoError(t, err, "Service should be retried and successfully synced to dest after recovery")
+	waitForFailedObjects(ctx, t, initialFailed)
 }
 
 func TestSyncerRetryFailedDelete(t *testing.T) {
@@ -875,7 +875,7 @@ func TestSyncerRetryFailedDelete(t *testing.T) {
 	faultInjector.failPatch.Store(false)
 	faultInjector.failDelete.Store(false)
 
-	initialFailures := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationDelete))
+	initialFailed := testutil.ToFloat64(FailedObjects.WithLabelValues("", "v1", "Service"))
 
 	// Create Syncer targeting dest-retry
 	syncer := &krmv1alpha1.KRMSyncer{
@@ -921,10 +921,9 @@ func TestSyncerRetryFailedDelete(t *testing.T) {
 
 	// Wait until delete failure metric increments
 	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
-		current := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationDelete))
-		return current > initialFailures, nil
+		return testutil.ToFloat64(FailedObjects.WithLabelValues("", "v1", "Service")) > initialFailed, nil
 	})
-	require.NoError(t, err, "Failure metric for delete should increment on failure")
+	require.NoError(t, err, "Failed objects gauge should count the object while delete is failing")
 
 	// Verify target service still exists in destination while failing
 	err = k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
@@ -939,6 +938,7 @@ func TestSyncerRetryFailedDelete(t *testing.T) {
 		return errors.IsNotFound(err), nil
 	})
 	assert.NoError(t, err, "Service deletion should be retried and succeed on dest after recovery")
+	waitForFailedObjects(ctx, t, initialFailed)
 }
 
 func TestSyncerRetryFailedStatus(t *testing.T) {
@@ -956,7 +956,7 @@ func TestSyncerRetryFailedStatus(t *testing.T) {
 	faultInjector.failDelete.Store(false)
 	faultInjector.failStatus.Store(false)
 
-	initialFailures := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationStatus))
+	initialFailed := testutil.ToFloat64(FailedObjects.WithLabelValues("", "v1", "Service"))
 
 	// Create syncer targeting dest-retry FIRST
 	syncer := &krmv1alpha1.KRMSyncer{
@@ -1005,10 +1005,9 @@ func TestSyncerRetryFailedStatus(t *testing.T) {
 
 	// Wait until status failure metric increments
 	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
-		current := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationStatus))
-		return current > initialFailures, nil
+		return testutil.ToFloat64(FailedObjects.WithLabelValues("", "v1", "Service")) > initialFailed, nil
 	})
-	require.NoError(t, err, "Failure metric for status should increment on failure")
+	require.NoError(t, err, "Failed objects gauge should count the object while status patch is failing")
 
 	// Now recover: allow status patch to succeed
 	faultInjector.failStatus.Store(false)
@@ -1022,6 +1021,7 @@ func TestSyncerRetryFailedStatus(t *testing.T) {
 		return len(destSvc.Status.LoadBalancer.Ingress) > 0 && destSvc.Status.LoadBalancer.Ingress[0].IP == "5.6.7.8", nil
 	})
 	assert.NoError(t, err, "Status update should be retried and succeed on dest after recovery")
+	waitForFailedObjects(ctx, t, initialFailed)
 }
 
 func TestSyncPeriodConfigurable(t *testing.T) {
@@ -1070,7 +1070,7 @@ func TestSyncPeriodConfigurable(t *testing.T) {
 	faultInjector.failStatus.Store(false)
 
 	targetServiceName := "target-service-sync-period"
-	initialFailures := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationApply))
+	initialFailed := testutil.ToFloat64(FailedObjects.WithLabelValues("", "v1", "Service"))
 
 	// Enable patch failure on destination to simulate error
 	faultInjector.failPatch.Store(true)
@@ -1106,10 +1106,9 @@ func TestSyncPeriodConfigurable(t *testing.T) {
 
 	// Wait until failure metric has incremented due to destination error
 	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
-		current := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationApply))
-		return current > initialFailures, nil
+		return testutil.ToFloat64(FailedObjects.WithLabelValues("", "v1", "Service")) > initialFailed, nil
 	})
-	require.NoError(t, err, "Failure metric for Service apply should increment")
+	require.NoError(t, err, "Failed objects gauge should count the Service while apply is failing")
 
 	// Destination service should not exist while apply is failing
 	destSvc := &corev1.Service{}
@@ -1128,6 +1127,7 @@ func TestSyncPeriodConfigurable(t *testing.T) {
 		return len(destSvc.Spec.Ports) > 0 && destSvc.Spec.Ports[0].Port == 8080, nil
 	})
 	require.NoError(t, err, "Service should be retried and synced to destination")
+	waitForFailedObjects(ctx, t, initialFailed)
 
 	// Now prove that the sync period setting works to resync when state is lost on destination
 	// without any updates to the source object:
@@ -1146,4 +1146,52 @@ func TestSyncPeriodConfigurable(t *testing.T) {
 		return len(destSvc.Spec.Ports) > 0 && destSvc.Spec.Ports[0].Port == 8080, nil
 	})
 	assert.NoError(t, err, "SyncPeriod should automatically trigger cache resync and restore destination object")
+}
+
+// waitForFailedObjects waits until syncer_failed_objects for v1 Services equals want.
+func waitForFailedObjects(ctx context.Context, t *testing.T, want float64) {
+	t.Helper()
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		return testutil.ToFloat64(FailedObjects.WithLabelValues("", "v1", "Service")) == want, nil
+	})
+	require.NoError(t, err, "a recovered object should no longer be counted as failed")
+}
+
+func TestSetupFailedGauge(t *testing.T) {
+	ctx := t.Context()
+	ns := "setup-failed-ns"
+	srcNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, k8sClientSource.Create(ctx, srcNamespace))
+	defer func() { _ = k8sClientSource.Delete(ctx, srcNamespace) }()
+
+	initial := testutil.ToFloat64(SetupFailed)
+
+	// Pull from a cluster that cannot be connected to: setup keeps failing.
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: "syncer-unreachable", Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode:   krmv1alpha1.ModePull,
+			Remote: testRemote("does-not-exist"),
+			Rules: []krmv1alpha1.ResourceRule{
+				{Group: "", Version: "v1", Kind: "ConfigMap", Namespaces: []string{ns}},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		return testutil.ToFloat64(SetupFailed) == initial+1, nil
+	})
+	require.NoError(t, err, "a KRMSyncer whose setup fails should be counted")
+
+	// Retries keep failing, but the KRMSyncer is still counted once.
+	time.Sleep(time.Second)
+	assert.Equal(t, initial+1, testutil.ToFloat64(SetupFailed))
+
+	// Deleting the KRMSyncer clears it.
+	require.NoError(t, k8sClientSource.Delete(ctx, syncer))
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		return testutil.ToFloat64(SetupFailed) == initial, nil
+	})
+	require.NoError(t, err, "a deleted KRMSyncer should no longer be counted")
 }
